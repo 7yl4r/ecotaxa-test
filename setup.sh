@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# One-time setup: creates the database, builds the schema, and creates the
+# initial administrator account. Safe to re-run (db creation/build steps are
+# skipped/no-op'd by postgres/ecotaxa if already done), but if you just want
+# to (re)start the stack afterwards use start.sh instead.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+ADMIN_EMAIL="administrator@mail.test"
+ADMIN_PASSWORD="1jMwVNobv3fWKb2w"
+
+echo "==> Starting the database..."
+docker compose up -d pgdb
+
+echo "==> Waiting for postgres to be healthy..."
+until [ "$(docker inspect -f '{{.State.Health.Status}}' ecotaxa_pgdb 2>/dev/null)" = "healthy" ]; do
+  sleep 2
+done
+
+echo "==> Creating the ecotaxa database..."
+docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -tc \
+  "SELECT 1 FROM pg_database WHERE datname = 'ecotaxa'" | grep -q 1 || \
+docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -c \
+  "CREATE DATABASE ecotaxa WITH OWNER=postgres ENCODING='UTF8' TEMPLATE=template0 LC_CTYPE='C' LC_COLLATE='C' CONNECTION LIMIT=-1;"
+
+echo "==> Starting the back-end..."
+docker compose up -d ecotaxaback
+sleep 5
+
+echo "==> Building the database schema..."
+docker exec -i ecotaxa_back bash -c "PYTHONPATH=. python cmds/manage.py db build"
+
+echo "==> Setting administrator credentials..."
+docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
+  "UPDATE users SET email='${ADMIN_EMAIL}', password='${ADMIN_PASSWORD}' WHERE id=1;"
+
+echo "==> Starting the full stack..."
+docker compose up -d
+
+cat <<EOF
+
+Setup complete.
+
+  URL:      http://localhost:8088
+  Login:    ${ADMIN_EMAIL}
+  Password: ${ADMIN_PASSWORD}
+
+Change the administrator password after first login.
+EOF

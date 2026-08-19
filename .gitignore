@@ -1,0 +1,11 @@
+.env
+vault/*
+!vault/.gitkeep
+ftp_area/*
+!ftp_area/.gitkeep
+file_srv/*
+!file_srv/.gitkeep
+models/*
+!models/.gitkeep
+eco_users_files/*
+!eco_users_files/.gitkeep

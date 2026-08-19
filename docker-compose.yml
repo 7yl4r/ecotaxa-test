@@ -1,0 +1,91 @@
+services:
+  nginx:
+    image: nginx:1.21.6
+    container_name: ecotaxa_nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./vault:/vault
+    networks:
+      - econet
+    ports:
+      - "8088:80"
+    depends_on:
+      - ecotaxafront
+      - ecotaxaback
+    restart: unless-stopped
+
+  ecotaxafront:
+    image: ecotaxa/ecotaxa_front:latest
+    container_name: ecotaxa_front
+    volumes:
+      - ./front_config:/app/config
+    networks:
+      - econet
+    depends_on:
+      - ecotaxaback
+    restart: unless-stopped
+
+  ecotaxaback:
+    image: ecotaxa/ecotaxa_back:latest
+    container_name: ecotaxa_back
+    volumes:
+      - ./back_config.ini:/config.ini
+      - ./ftp_area:/ftp_area
+      - ./file_srv:/file_srv
+      - ./vault:/vault
+      - ./models:/models
+      - temp_jobs:/temp_jobs
+      - ./eco_users_files:/eco_users_files
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - econet
+    depends_on:
+      pgdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # GPU-accelerated back-end for CNN-based prediction/segmentation jobs.
+  # Requires an NVIDIA GPU + the NVIDIA Container Toolkit on the host.
+  # Enable with: docker compose --profile gpu up -d
+  ecotaxagpuback:
+    image: ecotaxa/ecotaxa_gpu_back:latest
+    container_name: ecotaxa_gpu_back
+    profiles: ["gpu"]
+    volumes:
+      - ./back_config.ini:/config.ini
+      - ./vault:/vault
+      - ./models:/models
+      - temp_jobs:/temp_jobs
+    networks:
+      - econet
+    depends_on:
+      pgdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pgdb:
+    image: pgvector/pgvector:pg14
+    container_name: ecotaxa_pgdb
+    networks:
+      - econet
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+networks:
+  econet:
+    driver: bridge
+
+volumes:
+  temp_jobs:
+  pgdata:
