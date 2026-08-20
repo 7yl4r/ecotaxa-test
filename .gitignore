@@ -9,3 +9,6 @@ models/*
 !models/.gitkeep
 eco_users_files/*
 !eco_users_files/.gitkeep
+.venv-seed/
+seed/build/
+seed/build_summary.json

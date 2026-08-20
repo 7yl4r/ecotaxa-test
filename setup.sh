@@ -5,9 +5,9 @@
 # to (re)start the stack afterwards use start.sh instead.
 set -euo pipefail
 cd "$(dirname "$0")"
-
-ADMIN_EMAIL="administrator@mail.test"
-ADMIN_PASSWORD="1jMwVNobv3fWKb2w"
+set -a
+source .env
+set +a
 
 echo "==> Starting the database..."
 docker compose up -d pgdb
