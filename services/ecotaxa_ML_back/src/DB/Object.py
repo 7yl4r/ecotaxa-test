@@ -1,0 +1,349 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+# noinspection PyPackageRequirements
+from __future__ import annotations
+
+import datetime
+from typing import Dict, Set, Iterable, TYPE_CHECKING, List
+
+# noinspection PyPackageRequirements
+from sqlalchemy import Index, Column, ForeignKey, Integer, text, func, event, DDL  # fmt:skip
+# noinspection PyPackageRequirements
+from sqlalchemy.dialects.postgresql import (
+    BIGINT,
+    VARCHAR,
+    INTEGER,
+    DOUBLE_PRECISION,
+    DATE,
+    TIME,
+    FLOAT,
+    CHAR,
+    TIMESTAMP,
+)  # fmt:skip
+# noinspection PyPackageRequirements
+from sqlalchemy.orm import relationship, Session
+
+# from BO.helpers.TSVHelpers import convert_degree_minute_float_to_decimal_degree
+from .Acquisition import Acquisition
+from .Image import Image
+from .Project import Project, ProjectIDT
+from .Sample import Sample
+from .Taxonomy import Taxonomy
+from .User import User
+from .helpers.ORM import Model
+
+# Typings
+ObjectIDT = int
+ObjectIDListT = List[int]
+
+OBJ_PRJ_OFFSET = 100_000_000  # AKA 1e8
+
+if TYPE_CHECKING:
+    pass
+    # from .Image import Image
+
+# Classification qualification
+PREDICTED_CLASSIF_QUAL = "P"  # ML found, during the training starting at 'classif_date' moment, that the object _could be_ a 'classif_id' with 'classif_score' confidence.
+DUBIOUS_CLASSIF_QUAL = "D"  # 'classif_who' said at 'classif_date' moment that the object is _probably not_ a 'classif_id'
+VALIDATED_CLASSIF_QUAL = "V"  # 'classif_who' said at 'classif_date' moment that the object _is_ a 'classif_id'
+DISCARDED_CLASSIF_QUAL = "X"  # 'classif_who' said at 'classif_date' moment that the object _is not_ a 'classif_id'
+classif_qual_labels = {
+    PREDICTED_CLASSIF_QUAL: "predicted",
+    DUBIOUS_CLASSIF_QUAL: "dubious",
+    VALIDATED_CLASSIF_QUAL: "validated",
+    DISCARDED_CLASSIF_QUAL: "discarded",
+}
+CLASSIF_QUALS = set(classif_qual_labels.keys())
+classif_qual_revert = {}
+for k, v in classif_qual_labels.items():
+    classif_qual_revert[v] = k
+
+
+class ObjectHeader(Model):
+    __tablename__ = "obj_head"
+    # Self
+    objid = Column(BIGINT, primary_key=True, autoincrement=False)  # 8 bytes align d
+    # Parent
+    acquisid = Column(
+        BIGINT,
+        ForeignKey("acquisitions.acquisid", ondelete="CASCADE", onupdate="CASCADE"),
+        nullable=False,
+    )  # 8 bytes align d
+    # Author of last change in/to 'V' or 'D'
+    classif_who = Column(Integer, ForeignKey(User.id))  # 4 bytes align i
+    # User-visible classification
+    classif_id = Column(INTEGER, ForeignKey(Taxonomy.id))  # 4 bytes align i
+
+    # 86400 different values, basically all possible minutes of day
+    objtime = Column(TIME)  # 8 bytes align d
+    latitude = Column(DOUBLE_PRECISION)  # 8 bytes align d
+    longitude = Column(DOUBLE_PRECISION)  # 8 bytes align d
+    depth_min = Column(FLOAT)  # AKA DOUBLE_PRECISION, 8 bytes align d
+    depth_max = Column(
+        FLOAT
+    )  # AKA DOUBLE_PRECISION, 8 bytes align d # max = 99999999999 conventional value prevents move to float4
+    # _only_ 7018 different values
+    objdate = Column(DATE)  # 4 bytes align i
+    #
+    # One of the *_CLASSIF_QUAL above
+    classif_qual = Column(CHAR(1))  # 2 bytes (len + content) align c as len < 127
+    #
+    sunpos = Column(
+        CHAR(1)
+    )  # Sun position, from date, time and coords # 2 bytes (len + content) align c as len < 127
+    # Date of move to present classif_qual+classif_id, see top comment on states for details
+    classif_date = Column(TIMESTAMP)  # 8 bytes align d
+    # If the object is Predicted, its score
+    classif_score = Column(DOUBLE_PRECISION)  # 8 bytes align d
+
+    # User-provided identifier
+    orig_id = Column(
+        VARCHAR(255), nullable=False
+    )  # (len+1) bytes, align i if len > 127
+
+    # 176M values in DB as of 2024-02-02
+    object_link = Column(VARCHAR(255))
+
+    complement_info = Column(VARCHAR)  # e.g. "Part of ostracoda"
+
+    # The relationships are created in Relations.py but the typing here helps the IDE
+    fields: ObjectFields
+    cnn_features: relationship
+    classif: relationship
+    classifier: relationship
+    all_images: Iterable[Image]
+    acquisition: relationship
+    history: relationship
+
+    @classmethod
+    def get_next_pk(cls, session: Session, prj_id: int) -> int:
+        """
+        Return the next available primary key for a new Object in the given project.
+        """
+        session.execute(text("SELECT pg_advisory_xact_lock(1000, :id)"), {"id": prj_id})
+        res = (
+            session.query(func.max(cls.objid))
+            .filter(cls.objid >= prj_id * OBJ_PRJ_OFFSET)
+            .filter(cls.objid < (prj_id + 1) * OBJ_PRJ_OFFSET)
+            .scalar()
+        )
+        return res + 1 if res else prj_id * OBJ_PRJ_OFFSET + 1
+
+    @classmethod
+    def fetch_existing_objects(
+        cls, session: Session, prj_id: ProjectIDT
+    ) -> Dict[str, int]:
+        qry = session.query(ObjectHeader.orig_id, ObjectHeader.objid)
+        qry = qry.join(Acquisition).join(Sample).join(Project)
+        qry = qry.filter(Project.projid == prj_id)
+        qry = qry.filter(ObjectHeader.objid.op("<@")(func.obj_in_prj(prj_id)))
+        ret = {orig_id: objid for orig_id, objid in qry}
+        return ret
+
+    @classmethod
+    def fetch_existing_ranks(cls, session: Session, prj_id) -> Dict[int, Set[int]]:
+        ret: Dict[int, Set[int]] = {}
+        qry = session.query(Image.objid, Image.imgrank)
+        qry = qry.join(ObjectHeader).join(Acquisition).join(Sample).join(Project)
+        qry = qry.filter(ObjectHeader.objid.op("<@")(func.obj_in_prj(prj_id)))
+        qry = qry.filter(Project.projid == prj_id)
+        for objid, imgrank in qry:
+            ret.setdefault(objid, set()).add(imgrank)
+        return ret
+
+    # @staticmethod
+    # def _geo_from_txt(txt: str, min_v: float, max_v: float) -> float:
+    #     """Convert/check latitude or longitude before setting field
+    #     :raises ValueError"""
+    #     ret = convert_degree_minute_float_to_decimal_degree(txt)
+    #     if ret is None:
+    #         raise ValueError
+    #     if ret < min_v or ret > max_v:
+    #         raise ValueError
+    #     return ret
+
+    @staticmethod
+    def latitude_from_txt(txt: str) -> float:
+        return ObjectHeader._geo_from_txt(txt, -90, 90)
+
+    @staticmethod
+    def longitude_from_txt(txt: str) -> float:
+        return ObjectHeader._geo_from_txt(txt, -180, 180)
+
+    @staticmethod
+    def depth_from_txt(txt: str) -> float:
+        """Convert depth before setting field
+        :raises ValueError"""
+        return float(txt)
+
+    @staticmethod
+    def time_from_txt(txt: str) -> datetime.time:
+        """Convert/check time before setting field. HHMM with optional SS. Or strictly HH:MM:SS
+        :raises ValueError"""
+        if txt[2:3] == txt[5:6] == ":":
+            return datetime.time(int(txt[0:2]), int(txt[3:5]), int(txt[6:8]))
+        # Left pad with 0s as they tend to be truncated by spreadsheets e.g. 320 -> 0320
+        txt = "0" * (4 - len(txt)) + txt if len(txt) < 4 else txt
+        # Right pad with 0s for seconds e.g. 0320 -> 032000
+        txt += "0" * (6 - len(txt)) if len(txt) < 6 else ""
+        return datetime.time(int(txt[0:2]), int(txt[2:4]), int(txt[4:6]))
+
+    @staticmethod
+    def date_from_txt(txt: str) -> datetime.date:
+        """Convert/check date before setting field. Format YYYYMMDD or YYYY-MM-DD
+        :raises ValueError"""
+        if txt[4:5] == txt[7:8] == "-":
+            return datetime.date(int(txt[0:4]), int(txt[5:7]), int(txt[8:10]))
+        return datetime.date(int(txt[0:4]), int(txt[4:6]), int(txt[6:8]))
+
+    def __lt__(self, other):
+        return self.objid < other.objid
+
+
+USED_FIELDS_FOR_CLASSIF = {  # From Import user point of view, only these can be changed
+    ObjectHeader.classif_qual.name,
+    ObjectHeader.classif_id.name,
+    ObjectHeader.classif_date.name,
+    ObjectHeader.classif_who.name,
+    ObjectHeader.classif_score.name,
+}
+HIDDEN_FIELDS_FOR_CLASSIF:Set = set()  # Internally managed
+NON_UPDATABLE_VIA_API = USED_FIELDS_FOR_CLASSIF.union(HIDDEN_FIELDS_FOR_CLASSIF)
+
+
+class ObjectFields(Model):
+    __tablename__ = "obj_field"
+    objfid = Column(
+        BIGINT,
+        ForeignKey(ObjectHeader.objid, ondelete="CASCADE", onupdate="CASCADE"),
+        primary_key=True,
+    )
+    # Not a real FK, this is used for a cluster which groups together data blocks by acquisition
+    # TODO: Remove in favor of PK projid header
+    acquis_id = Column(BIGINT, nullable=False)
+    # The relationships are created in Relations.py but the typing here helps the IDE
+    object: relationship
+
+
+# TODO
+# event.listen(
+#     ObjectsFields.__table__,
+#     "after_create",
+#     DDL("ALTER TABLE obj_field SET (fillfactor = 90, statistics_target = 10000)"
+#         ).execute_if(dialect='postgresql')
+# )
+
+# Add free columns, numerical and textual ones
+for i in range(1, 501):
+    # 8 bytes each, if present
+    setattr(ObjectFields, "n%02d" % i, Column(FLOAT))
+for i in range(1, 21):
+    setattr(ObjectFields, "t%02d" % i, Column(VARCHAR(250)))
+
+
+Index(  # We CLUSTER using this one, object ids tend to be consecutively read
+    "obj_field_acquisid_objfid_idx",
+    ObjectFields.__table__.c.acquis_id,
+    ObjectFields.__table__.c.objfid,
+    unique=True,
+)
+
+# TODO if helpful, partial indexes e.g.:
+# CREATE INDEX idx_obj_field_9107_10955_n01_speedup
+#  ON obj_field_9107_10955 (n01 DESC, objfid DESC)
+#  WHERE objfid BETWEEN 927900000000 AND 928000000000;
+# But need to name the partition.
+
+# Nearly-always used index for recursive descent into object tree, e.g. in manual classification page.
+# Also for FK checks during deletion.
+Index(
+    "is_objectsacqclassifqual",
+    ObjectHeader.__table__.c.acquisid,
+    ObjectHeader.__table__.c.objid,
+    postgresql_include=[
+        ObjectHeader.__table__.c.classif_qual,
+        ObjectHeader.__table__.c.classif_id,
+    ],
+    unique=True,
+)
+
+# For finding globally objects in some depth range
+Index(
+    "is_objectsdepth",
+    ObjectHeader.__table__.c.depth_max,
+    ObjectHeader.__table__.c.depth_min,
+    postgresql_include=[ObjectHeader.acquisid.name],
+)
+# For finding globally objects in some geo range
+Index(
+    "is_objectslatlong",
+    ObjectHeader.__table__.c.latitude,
+    ObjectHeader.__table__.c.longitude,
+    postgresql_include=[ObjectHeader.acquisid.name],
+)
+# For finding globally objects in some time range
+Index(
+    "is_objectstime",
+    ObjectHeader.__table__.c.objtime,
+    postgresql_include=[ObjectHeader.acquisid.name],
+)
+Index(
+    "is_objectsdate",
+    ObjectHeader.__table__.c.objdate,
+    postgresql_include=[ObjectHeader.acquisid.name],
+)
+
+DEFAULT_CLASSIF_HISTORY_DATE = "TO_TIMESTAMP(0)"
+
+
+class ObjectsClassifHisto(Model):
+    __tablename__ = "objectsclassifhisto"
+    objid = Column(
+        BIGINT,
+        ForeignKey(ObjectHeader.objid, ondelete="CASCADE", onupdate="CASCADE"),
+        primary_key=True,
+    )  # 8 bytes align d
+    # Date of manual setting of 'V' or 'D', training date for 'P'
+    classif_date = Column(TIMESTAMP, primary_key=True)  # 8 bytes align d
+    # The score associated with 'P' state
+    classif_score = Column(DOUBLE_PRECISION)  # 8 bytes align d
+    classif_id = Column(
+        INTEGER, ForeignKey(Taxonomy.id, ondelete="CASCADE"), nullable=False
+    )  # 4 bytes align i
+    # The person who caused the 'D' or 'V' state
+    classif_who = Column(Integer, ForeignKey(User.id))  # 4 bytes align i
+    classif_qual = Column(
+        CHAR(1), nullable=False
+    )  # 2 bytes (len + content) align c as len < 127
+    # The relationships are created in Relations.py but the typing here helps the IDE
+    object: relationship
+    classif: relationship
+    classifier: relationship
+
+
+# Usage, e.g.
+# SQL: SELECT count(*) FROM obj_head WHERE objid <@ obj_in_prj(9279);
+# SQLA Core: query = select(cls).where(cls.objid.op("<@")(func.obj_in_prj(21433)))
+# SQLA Query: stmt = select(ObjectHeader).where(
+#     ObjectHeader.objid.op("<@")(func.obj_in_prj(21433))
+# )
+_create_func_ddl = DDL(f"""
+CREATE OR REPLACE FUNCTION obj_in_prj(prj_id int)
+RETURNS int8range AS $$
+  SELECT int8range(
+    prj_id * {OBJ_PRJ_OFFSET}::bigint,
+    (prj_id + 1) * {OBJ_PRJ_OFFSET}::bigint,
+    '[)'
+  );
+$$ LANGUAGE sql IMMUTABLE;
+
+GRANT EXECUTE ON FUNCTION obj_in_prj(int) TO PUBLIC;
+""")
+
+event.listen(
+    ObjectHeader.__table__,
+    "after_create",
+    _create_func_ddl.execute_if(dialect="postgresql"),
+)

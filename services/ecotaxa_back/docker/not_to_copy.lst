@@ -1,0 +1,16 @@
+*venv*
+__pycache__
+*.pyc
+.idea
+*.log
+*.old
+.mypy_cache
+run.build
+run.bin
+config.ini*
+mypy.ini
+coverage.xml
+gen_clients.sh
+openapi*.json
+unused
+

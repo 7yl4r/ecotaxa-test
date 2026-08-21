@@ -1,0 +1,302 @@
+"""
+Build the DB from scratch in EcoTaxa.
+"""
+
+import shutil
+import socket
+import sys
+import time
+from os import environ
+from os.path import join, dirname, realpath
+from pathlib import Path
+
+from API_operations.helpers.Service import Service
+from tools.lib.processes import SyncSubProcess
+from tests.consts import SHARED_DIR, FTP_DIR, TEST_DIR
+
+psql_bin = "psql"
+# If we already have a server don't create one, e.g. in GitHub action
+PG_HOST = environ.get("POSTGRES_HOST")
+PG_PORT = environ.get("POSTGRES_PORT")
+
+if PG_HOST and PG_PORT:
+    PG_PORT = int(PG_PORT)
+else:
+    pg_lib = "/usr/lib/postgresql/18/bin/"  # ============ 124 passed, 1 skipped, 4 warnings in 221.91s (0:03:41) ============
+    pgctl_bin = join(pg_lib, "pg_ctl")
+    initdb_bin = join(pg_lib, "initdb")
+    mustExist = [pgctl_bin, initdb_bin]
+    for aFile in mustExist:
+        if not Path(aFile).exists():
+            print("File/directory %s not found where expected" % aFile)
+            sys.exit(-1)
+    PG_PORT = 5440
+
+
+def is_port_opened(host: str, port: int):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex((host, port))
+    sock.close()
+    return result == 0
+
+
+DB_NAME = "ecotaxa"
+DB_PASSWORD = "postgres12"
+
+
+class EcoTaxaDBFrom0(object):
+    def __init__(self, dbdir: Path, conffile: Path):
+        self.db_dir = dbdir.resolve()
+        self.data_dir = self.db_dir / "Data"
+        self.pwd_file = self.db_dir / "pg_pwd.txt"
+        self.v22_schema_creation_file = self.db_dir / "schem_prod.sql"
+        self.schema_upgrade_file = self.db_dir / "upgrade_prod.sql"
+        self.data_load_file = self.db_dir / "data_load.sql"
+        self.conf_file = conffile
+        self.host = None
+        self.shared_dir = SHARED_DIR
+        self.ftp_dir = FTP_DIR
+        self.jobs_dir = TEST_DIR / "temptask"
+        self.vault_dir = TEST_DIR / "vault"
+        self.models_dir = SHARED_DIR / "models"
+        self.users_files_dir = TEST_DIR / "eco_users_files"
+
+    def get_env(self):
+        # Return the environment for postgres subprocesses
+        ret = {
+            "PGDATA": self.data_dir,
+            "PGDATABASE": DB_NAME,
+            "PGLOG": self.db_dir / "log.txt",
+        }
+        return ret
+
+    def init(self):
+        # Create data files
+        pg_opts = [
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "-E",
+            "Latin1",
+            "--locale=C",
+            "--pwfile=%s" % self.pwd_file,
+        ]
+        cmd = [initdb_bin] + pg_opts
+        SyncSubProcess(cmd, env=self.get_env())
+
+    def launch(self):
+        # Produce connection sockets in a user-writable directory (linux)
+        pg_opts = [
+            "-o",
+            '-c unix_socket_directories="'
+            + str(self.db_dir / "run")
+            + '" '  # Speed up DB operations
+            + "-c fsync=off -c synchronous_commit=off -c full_page_writes=off",
+        ]
+        pg_opts += ["-o", '"-p %d"' % PG_PORT]
+        cmd = [pgctl_bin, "start", "-W"] + pg_opts
+        # Cook an environment for the subprocess
+        # we do NOT use os.environ in order not to pollute current process
+        # Note: the process dies right away as pgctl launches a daemon
+        SyncSubProcess(
+            cmd,
+            env=self.get_env(),
+            out_file=self.db_dir / "logs" / "postgres_start.log",
+        )
+        # Wait until the server port is opened
+        start_time = time.time()
+        while not is_port_opened(self.host, PG_PORT):
+            time.sleep(0.5)
+            if (time.time() - start_time) > 30:
+                raise Exception("Waited too long for PG up")
+
+    def shutdown(self, host: str):
+        # Stop command
+        cmd = [pgctl_bin, "stop", "-D", self.data_dir]
+        # Cook an environment for the subprocess
+        SyncSubProcess(
+            cmd, env=self.get_env(), out_file=self.db_dir / "logs" / "postgres_stop.log"
+        )
+        # Wait until the server port is closed
+        start_time = time.time()
+        while is_port_opened(host, PG_PORT):
+            time.sleep(0.5)
+            if (time.time() - start_time) > 30:
+                raise Exception("Waited too long for PG down")
+
+    def runs(self) -> bool:
+        if not self.host:
+            return False
+        return is_port_opened(self.host, PG_PORT)
+
+    def build(self, password):
+        """
+        Build the DB
+        """
+        CREATE_DB_SQL = """
+                        create DATABASE %s
+                        WITH ENCODING='UTF8'
+                        OWNER=%s
+                        TEMPLATE=template0 LC_CTYPE='C' LC_COLLATE='C' CONNECTION LIMIT=-1 \
+                        """
+
+        # Load the configuration from the file we just wrote
+        environ["APP_CONFIG"] = str(self.conf_file)
+        from helpers.AppConfig import Config
+
+        app_config = Config()
+
+        def drop(user: str = "postgres", password: str = "", db_name: str = ""):
+            super_conn = Service.build_super_connection(app_config, user, password)
+            db_drop_sql = "DROP DATABASE IF EXISTS %s ( FORCE )" % db_name
+            super_conn.exec_outside_transaction(db_drop_sql)
+
+        def create(user: str = "postgres", password: str = "", db_name: str = ""):
+            super_conn = Service.build_super_connection(app_config, user, password)
+            db_user, _ = app_config.get_db_credentials()
+            db_create_sql = CREATE_DB_SQL % (db_name, db_user)
+            try:
+                super_conn.exec_outside_transaction(db_create_sql)
+            except:
+                pass
+
+        def pg_build():
+            conn = Service.build_connection(app_config)
+            conn.exec_outside_transaction("CREATE EXTENSION IF NOT EXISTS vector;")
+            from DB.Project import Project
+
+            # It's the same metadata object for the whole app, so pick one
+            meta = Project.metadata
+
+            # Create the tables
+            meta.create_all(bind=conn.engine)
+            # Load static data
+            # sess = conn.get_session()
+            # _init_security(sess)
+            # _do_static(sess)
+
+        drop(db_name=DB_NAME, password=password)
+        create(db_name=DB_NAME, password=password)
+        pg_build()
+
+    def direct_SQL(self, password):
+        # -h localhost force use of TCP/IP socket, otherwise psql tries local pipes in /var/run
+        env = {"PGPASSWORD": password}
+        pg_opts = ["-U", "postgres", "-h", self.host, "-p", "%d" % PG_PORT]
+        # Data load
+        schem_opts = ["-d", DB_NAME, "-f", self.data_load_file]
+        cmd = [psql_bin] + pg_opts + schem_opts
+        SyncSubProcess(cmd, env=env, out_file=self.db_dir / "logs" / "data_load.log")
+
+    def create(self):
+        if not (PG_HOST and PG_PORT):
+            self.host = "localhost"
+            if not is_port_opened(self.host, PG_PORT):
+                # Accept to reuse a server if it did not die last time
+                self.init()
+                self.launch()
+            # TODO: Password (in call to self.direct_SQL) is ignored in this context
+        else:
+            self.host = PG_HOST
+        self.write_config()
+        self.build(DB_PASSWORD)
+        self.direct_SQL(DB_PASSWORD)
+
+    DIR_TEMPLATES = (
+        Path(dirname(realpath(__file__)))
+        / ".."
+        / ".."
+        / ".."
+        / "config_templates/account_validation_mails"
+    ).resolve()
+    DIR_USERS_FILES = (
+        Path(dirname(realpath(__file__))) / ".." / ".." / ".." / "eco_users_files"
+    ).resolve()
+    CAPTCHA_LIST = (
+        Path(dirname(realpath(__file__))) / ".." / ".." / ".." / "utils"
+    ).resolve()
+    TIMETOLIVE = 10
+    CONF = f"""
+[default]
+[conf]
+DB_USER=postgres
+DB_PASSWORD={DB_PASSWORD}
+DB_HOST=%s
+DB_PORT=%d
+DB_DATABASE={DB_NAME}
+RO_DB_USER=readerole
+RO_DB_PASSWORD=Ec0t1x1Rd4
+RO_DB_HOST=%s
+RO_DB_PORT=%d
+RO_DB_DATABASE={DB_NAME}
+THUMBSIZELIMIT=99
+SECRET_KEY = THIS KEY MUST BE CHANGED
+VAULT_DIR = %s
+JOBS_DIR = %s
+SERVERLOADAREA = %s
+FTPEXPORTAREA = %s
+MODELSAREA = %s
+USERSFILESAREA = %s
+SECURITY_PASSWORD_HASH=sha512_crypt
+SECURITY_PASSWORD_SALT=PePPER
+APPMANAGER_Name=Sam One
+APPMANAGER_EMAIL=someone@somewhere.org
+MAILSERVICE_SECRET_KEY = THIS KEY MUST BE CHANGED ANS IS ONLY FOR TOKENS SENT BY MAIL
+MAILSERVICE_SALT = "mailservice_salt"
+SENDER_ACCOUNT = senderemail@testsendermailtest.com,senderpwd,senderdns
+TAXOSERVER_URL = http://ecotaxoserver.dev.com
+TAXOSERVER_INSTANCE_ID = 123455
+TAXOSERVER_SHARED_SECRET = qsdf3fsdtre5665TY
+INSTANCE_ID = EcoTaxa.01
+USER_EMAIL_VERIFICATION = off
+ACCOUNT_VALIDATION = off
+ADD_TICKET = ***
+DIR_MAIL_TEMPLATES = {DIR_TEMPLATES}
+SERVERURL= https://my.real.site:443
+MAX_UPLOAD_SIZE = 681574400
+TIMETOLIVE = {TIMETOLIVE}
+ACCEPTED_MIME_TYPES = application/zip,application/gzip,application/x-tar,text/plain,text/csv,text/tab-separated-values,image/jpeg,image/png,image/x-png,image/gif,image/tiff
+ARCHIVE_EXTENSIONS = zip,tar,gzip,tar.gz,tar.bz2,tar.xz,gz
+OPENID_CLIENT_ID=ecotaxa
+OPENID_CLIENT_SECRET=ugrv75rZRlVvUdk4YJE58sJulITDo0c8
+OPENID_METADATA_URL=https://my.keycloack.com/realms/theia/.well-known/openid-configuration
+"""
+
+    def write_config(self):
+        with open(str(self.conf_file), "w") as f:
+            f.write(
+                self.CONF
+                % (
+                    self.host,
+                    PG_PORT,
+                    self.host,
+                    PG_PORT,
+                    self.vault_dir,
+                    self.jobs_dir,
+                    self.shared_dir,
+                    self.ftp_dir,
+                    self.models_dir,
+                    self.users_files_dir,
+                )
+            )
+
+    def cleanup(self):
+        # Remove data files
+        if not (PG_HOST and PG_PORT):
+            self.shutdown("localhost")
+            shutil.rmtree(self.data_dir, ignore_errors=True)
+        else:
+            # Server should do the cleanup, e.g. exit docker
+            pass
+
+
+if __name__ == "__main__":
+    HERE = Path(dirname(realpath(__file__)))
+    PG_DIR = HERE / ".." / "pg_files"
+    db = EcoTaxaDBFrom0(PG_DIR, Path("fakeconf"))
+    try:
+        db.cleanup()
+    except FileNotFoundError:
+        pass
+    db.create()

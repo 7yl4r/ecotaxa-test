@@ -1,0 +1,31 @@
+hyphenator
+# To ensure all is installed and only them:
+# (venv)$ pip freeze | xargs pip uninstall -y
+# (venv)$ pip install -r requirements.txt
+
+# Web
+Flask==3.1.2
+Werkzeug==3.1.2
+Flask-Babel==4.0.0
+Flask-Login==0.6.3
+# For json parsing in generated to_back/* code.
+python-dateutil==2.8.2
+# For speedup in booster.py
+orjson==3.11.6
+# For proper file upload to back-end. urllib3 does not stream, full file is needed.
+requests==2.32.5
+# Latin hyphenation of taxa names
+hyphenator==0.6.0
+# Typings
+types-python-dateutil
+types-certifi
+types-requests
+types-six
+# QA & compilation
+mypy==1.19.1
+mypy_extensions==1.1.0
+# Auth validation
+itsdangerous==2.2.0
+#markupsafe
+markupsafe==3.0.3
+

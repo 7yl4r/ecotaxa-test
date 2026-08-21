@@ -1,0 +1,73 @@
+# This is a basic workflow to help you get started with Actions
+
+name: tests
+
+# Controls when the action will run.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  test:
+    environment: Env_for_Actions
+    # The type of runner that the job will run on
+    runs-on: [ubuntu-latest]
+    # Virgin container
+    container: ubuntu:22.04
+
+    # Service containers to run with `container-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: pgvector/pgvector:0.8.2-pg18-trixie
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: postgres12
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5           
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    # node (or a lib of) is needed by codecov (or GH)
+    # old version of python from this ppa
+    - run: apt-get update
+    - run: apt-get install software-properties-common gpg-agent --no-install-recommends --yes
+    # - run: apt-get update
+    - run: TZ=Etc/UTC ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+    - run: add-apt-repository ppa:deadsnakes/ppa
+    - run: apt-get update
+    # git is needed by codecov
+    - run: apt-get install -y git
+    # python & psql (for the test DB) from repo, same as prod docker
+    - run: apt-get install
+        python3.8 python3-venv python3.8-dev python3.8-venv
+        postgresql-client-14 libpq-dev
+        gcc make file cython3
+        --no-install-recommends --yes
+    - run: python3.8 -m venv /venv
+    - run: PATH=/venv/bin pip3 install --upgrade pip wheel
+    # Checkout.
+    - uses: actions/checkout@v4
+    # Run both tests and coverage
+    - run: PATH=/venv/bin:$PATH pip3 install tox==4.25.0
+    - name: Run tox in QA
+      working-directory: ./QA/py
+      run: |
+        PATH=/venv/bin PYTHONPATH=. tox
+      env:
+        # The hostname used to communicate with the PostgreSQL service container
+        POSTGRES_HOST: postgres
+        # The default PostgreSQL port
+        POSTGRES_PORT: 5432
+    - name: Upload coverage report
+      # Code coverage.
+      uses: codecov/codecov-action@v4
+      with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true # optional (default = false)

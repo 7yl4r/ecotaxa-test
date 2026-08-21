@@ -1,0 +1,419 @@
+from typing import List, Optional, Union, Dict
+from flask import render_template, flash, request, redirect, url_for
+from flask_login import current_user
+from appli import gvp, gvpm
+from appli.gui.staticlistes import py_messages
+
+######################################################################################################################
+from appli.utils import ApiClient
+from to_back.ecotaxa_cli_py import ApiException
+from to_back.ecotaxa_cli_py.api import ProjectsApi, UsersApi
+from to_back.ecotaxa_cli_py.models import (
+    ProjectModel,
+    MinUserModel,
+    UserModelWithRights,
+    MinimalCollectionBO,
+)
+from appli.gui.commontools import possible_access, possible_models
+from appli.back_config import get_back_constants
+import json
+import re
+
+# valid formulae keys - also used to split a legacy formulae string into a dict
+FORMULAE_KEYS = ["total_water_volume", "subsample_coef", "individual_volume"]
+
+###############################################common for create && edit  #######################################################################
+
+
+def get_target_prj(
+    prjid: int, for_managing: bool = False, full=True
+) -> Union[ProjectModel, Dict, None]:
+    with ApiClient(ProjectsApi, request) as api:
+        try:
+            target_proj: ProjectModel = api.project_query(
+                prjid, for_managing=for_managing
+            )
+            if target_proj is not None:
+                if full:
+                    return target_proj
+                else:
+                    return dict(
+                        {
+                            "title": target_proj.title,
+                            "projid": target_proj.projid,
+                            "managers": target_proj.managers,
+                            "annotators": target_proj.annotators,
+                            "viewers": target_proj.viewers,
+                            "status": target_proj.status,
+                            "access": target_proj.access,
+                            "formulae": target_proj.formulae,
+                        }
+                    )
+        except ApiException as ae:
+            if ae.status in (401, 403):
+                flash(py_messages["notauthorized"], "error")
+            elif ae.status == 404:
+                flash(py_messages["project404"], "error")
+    return None
+
+
+def _get_prj_collections(prjid: int) -> List[MinimalCollectionBO]:
+    collections = list([])
+    with ApiClient(ProjectsApi, request) as api:
+        try:
+            collections: List[MinimalCollectionBO] = api.project_collections(prjid)
+        except ApiException:
+            pass
+
+    return collections
+
+
+def _prj_users_list(ids: list) -> dict:
+    users_list = {}
+    with ApiClient(UsersApi, request) as api:
+        all_users: List[MinUserModel] = api.search_user(by_name="%%")
+        for a_user in sorted(all_users, key=lambda u: u.name.strip().lower()):
+            if (str(a_user.id)) in ids:
+                users_list[str(a_user.id)] = a_user
+    return users_list
+
+
+def _cannot_do_message(autho, prjid=0):
+    message = "notautho"
+
+    if autho == 1:
+        if prjid == 0:
+            message = "noauthoprjcreate"
+        else:
+            message = "noauthoprjedit"
+    elif autho == 2:
+        message = "noautho2"  # ???
+    elif autho == 3:
+        message = "noautho3"  # ???
+    return message
+
+
+def _user_cando(autho):
+    user: UserModelWithRights = current_user.api_user
+    if not user or not current_user.is_active or autho not in user.can_do:
+        flash(_cannot_do_message(autho), "error")
+        return False
+    else:
+        return True
+
+
+def _manage_prefixes(formula, direction=True):
+    noneformulae = [
+        "total_water_volume/1000",
+        "1/subsampling_coefficient",
+        "4/3 * math.pi * (math.sqrt(area/math.pi)*pixel_size)**3",
+        "4/3 * math.pi * (major_axis * pixel_size) * (minor_axis * pixel_size)**2",
+        "4/3 * pi * (major_axis * pixel_size) * (minor_axis * pixel_size)^2'",
+    ]
+    for val in noneformulae:
+        if formula == val:
+            formula = ""
+    if direction:
+        prefixes = {
+            "sample": "sam",
+            "object": "obj",
+            "subsample": "ssm",
+            "subsample": "ssm",
+        }
+        for key, value in prefixes.items():
+            value = value.strip()
+            formula = formula.replace(value + ".", key + ".")
+    else:
+        prefixes = {
+            "sample": "sam",
+            "object": "obj",
+            "acquisition": "ssm",
+            "process": "ssm",
+        }
+        for key, value in prefixes.items():
+            formula = formula.replace(key + ".", value + ".")
+    return formula
+
+
+def _formulae_str_to_dict(formulae: Union[dict, str, None]) -> Optional[dict]:
+    """Normalize target_proj.formulae (dict, legacy string, or None) into a dict.
+
+    The back-end can return formulae as a dict already, as the string "None",
+    or as one string where each valid key (FORMULAE_KEYS) is directly
+    followed by ':' and its value, with no reliable separator between
+    entries (blank, \r, \r\n or nothing at all).
+    """
+    if isinstance(formulae, dict):
+        return formulae
+    if formulae is None or formulae == "None" or formulae.strip() == "":
+        return None
+    try:
+        parsed = json.loads(formulae)
+        if isinstance(parsed, dict):
+            return parsed if parsed else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+    keys_pattern = "|".join(FORMULAE_KEYS)
+    normalized = re.sub(r"\s*(" + keys_pattern + r"):", r";\1:", formulae.strip())
+    result = {}
+    for chunk in normalized.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        key, _, value = chunk.partition(":")
+        value = value.strip()
+        result[key] = None if value == "None" else value
+    return result if result else None
+
+
+def _formulae_to_json_str(formulae: Union[dict, str, None]) -> Optional[str]:
+    """Serialize a formulae dict into a JSON string ready to be saved.
+
+    Complements _formulae_str_to_dict: turns the in-memory dict back into a
+    string that json.loads can parse.
+
+    Never returns None: the generated API client drops None attributes from
+    the request body entirely (see sanitize_for_serialization), which makes
+    the back-end fall back to its own non-JSON legacy default for formulae
+    and reject it with a 422. An empty JSON object is sent instead so the
+    key is always present and valid.
+    """
+    if isinstance(formulae, dict):
+        return json.dumps(formulae) if formulae else "{}"
+    return formulae if formulae is not None else "{}"
+
+
+def prj_create() -> str:
+    if not _user_cando(1):
+        from werkzeug.exceptions import Forbidden
+        from appli.gui.staticlistes import py_user
+
+        raise Forbidden(py_user["notauthorized"])
+    to_save = gvp("save")
+    if to_save == "Y":
+        title = gvp("title" or "")
+        instrument = gvp("instrument" or "")
+        if title == "" or instrument == "":
+            flash("titleinstrumentrequired", "error")
+        else:
+            from to_back.ecotaxa_cli_py.models import CreateProjectReq
+
+            with ApiClient(ProjectsApi, request) as api:
+                req = CreateProjectReq(title=title, instrument=instrument)
+                rsp: int = api.create_project(req)
+            return prj_edit(rsp, new=True)
+    scn = possible_models()
+    access = possible_access()
+    formulae = get_back_constants("FORMULAE")
+    default_access = get_back_constants("DEFAULT_ACCESS")
+    return render_template(
+        "v2/project/projectsettings.html",
+        target_proj=None,
+        members=None,
+        new=True,
+        scn=scn,
+        possible_access=access,
+        default_access=default_access,
+        formulae=formulae,
+    )
+
+
+def prj_edit(prjid: int, new: bool = False):
+    # Security & sanity checks
+    # get target_proj
+
+    from appli.gui.staticlistes import py_messages
+
+    target_proj = get_target_prj(prjid, for_managing=True)
+    if target_proj is None:
+        flash(py_messages["selectotherproject"], "info")
+        return redirect(url_for("gui_prj_noright", projid=prjid))
+    target_proj.formulae = _formulae_str_to_dict(target_proj.formulae)
+    # Reconstitute members list with privs
+    # data structure used in both display & submit
+    if gvp("save") == "Y":
+        # Load posted variables
+        previous_cnn = target_proj.cnn_network_id
+        # posted_contact_id = None
+        # Update the project (from API call) with posted variables
+
+        # same names as in target_proj
+        for a_var in request.form:
+            if a_var in dir(target_proj):
+                setattr(target_proj, a_var, gvp(a_var))
+
+        # other
+        posted_classif_list = gvpm("inittaxo[]")
+        # The original list is displayed using str(list), so there is a bit of formatting inside
+        posted_classif_list = ",".join(posted_classif_list).replace(" ", "")
+        target_proj.init_classif_list = [
+            int(cl_id) for cl_id in posted_classif_list.split(",") if cl_id.isdigit()
+        ]
+
+        posted_contact_id = gvp("contact_user_id")
+        if new != True and previous_cnn != target_proj.cnn_network_id:
+            flash(py_messages["scnerased"], "success")
+        # process members privileges results - members_by_right is empty as backend records are deleted on every update
+        # process formulae
+
+        formulae = {}
+        for a_var in FORMULAE_KEYS:
+            ret = gvp(a_var, "").strip()
+
+            if ret != "":
+                formulae[a_var] = _manage_prefixes(ret, False)
+
+        checkformulae = target_proj.formulae
+        if checkformulae != formulae:
+            setattr(target_proj, "formulae", formulae)
+        do_update = True
+        contact_user = None
+        err_msg = []
+        data = {"member": [], "privilege": []}
+        members_by_right = {
+            "Manage": target_proj.managers,
+            "Annotate": target_proj.annotators,
+            "View": target_proj.viewers,
+        }
+
+        # empty target_proj privileges field
+        for priv in members_by_right.keys():
+            for m in members_by_right[priv].copy():
+                members_by_right[priv].remove(m)
+
+        for key in data:
+            values = gvpm("members[" + key + "]")
+            data[key] = values
+
+        # list all privileges in list_users key:'id'
+        if len(data["member"]):
+            ids = data["member"]
+
+            users_list = _prj_users_list(ids=ids)
+        else:
+            users_list = {}
+            do_update = False
+        for i in range(len(data["member"])):
+            member = data["member"][i]
+            if member in users_list.keys():
+                priv = data["privilege"][i]
+                if priv in members_by_right.keys():
+                    member_to_add = users_list[member]
+                    for right, members_added in members_by_right.items():
+                        if member_to_add in members_added:
+                            if right != priv:
+                                # check duplicates with diff rights - must be impossible with the new front js (does not send duplicates or elements to delete )
+                                err_msg.append(
+                                    py_messages["memberexistdifferentpriv"]
+                                    + users_list[member].name
+                                )
+                                do_update = False
+                            member_to_add = 0
+                            break
+
+                    if priv == "Manage" and member == posted_contact_id:
+                        contact_user = users_list[member]
+                    if member_to_add != 0:
+                        members_by_right[priv].append(users_list[member])
+                else:
+                    # privilege empty
+                    err_msg.append(
+                        py_messages["privnotsetfor"] + users_list[member].name
+                    )
+
+            else:
+                # member is not in users list
+                err_msg.append(py_messages["membernomoreinlist"] + member)
+                do_update = False
+        for msg in err_msg:
+            flash(msg, "error")
+        if contact_user is None:
+            flash(
+                "getcontactuserinmanagers",
+                "error",
+            )
+            do_update = False
+        else:
+            # OK we have someone
+            target_proj.contact = contact_user
+        # Managers sanity check
+        if len(target_proj.managers) == 0:
+            flash("managerrequired", "error")
+            do_update = False
+        # Update on back-end
+        if do_update:
+            target_proj.formulae = _formulae_to_json_str(target_proj.formulae)
+            try:
+                with ApiClient(ProjectsApi, request) as api:
+                    api.update_project(
+                        project_id=target_proj.projid, project_model=target_proj
+                    )
+                    if new:
+                        message = py_messages["projectcreated"]
+                    else:
+                        message = py_messages["projectupdated"]
+                    flash(
+                        message + " " + target_proj.title,
+                        "success",
+                    )
+                    # if new == True:
+                    # redirect to import after 3 s
+                    #    redir = "/Job/Create/FileImport?p=" + str(target_proj.projid)
+                    # redir = "/prj/" + str(target_proj.projid) + "?next=import"
+                    # else:
+                    # redirect to classif
+                    redir = url_for("gui_prj_edit", prjid=target_proj.projid)
+                    return redirect(redir)
+            except ApiException as ae:
+                flash(py_messages["updateexception"] + "%s" % ae.reason)
+    lst = [str(tid) for tid in target_proj.init_classif_list]
+    # common func used in project stats
+    from appli.gui.taxonomy.tools import taxo_with_names
+
+    predeftaxo = taxo_with_names(lst)
+
+    scn = possible_models()
+
+    # TODO: Cache of course, it's constants!
+    access = possible_access()
+    members_by_right = {
+        "Manage": target_proj.managers.copy(),
+        "Annotate": target_proj.annotators.copy(),
+        "View": target_proj.viewers.copy(),
+    }
+    collections = _get_prj_collections(prjid)
+    from appli.gui.commontools import crsf_token
+
+    defcols = dict(
+        {
+            "mappingobj": "obj",
+            "mappingsample": "sample",
+            "mappingprocess": "process",
+            "mappingacq": "acquisition",
+        }
+    )
+    freecols = {}
+
+    for column, prefix in defcols.items():
+        freecols[column] = getattr(target_proj, prefix + "_free_cols")
+
+    formulae = _formulae_str_to_dict(target_proj.formulae) or {}
+    for key, value in formulae.items():
+        formulae[key] = _manage_prefixes(value, True)
+    return render_template(
+        "v2/project/projectsettings.html",
+        target_proj=target_proj,
+        members_by_right=members_by_right,
+        scn=scn,
+        crsf_token=crsf_token(),
+        predeftaxo=predeftaxo,
+        freecols=freecols,
+        possible_access=access,
+        collections=collections,
+        formulae=formulae,
+        new=new,
+        # redir=redir,
+    )
+
+
+######################################################################################################################

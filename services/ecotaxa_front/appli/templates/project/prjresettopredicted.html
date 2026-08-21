@@ -1,0 +1,20 @@
+{{ header|safe }}
+<style>
+  #mytab td {padding: 5px;}
+</style>
+<form method=post>
+  <input type="hidden" name="process" value="Y">
+    <table id=mytab >
+      <tr>
+        <td colspan="2" style="text-align: center"><button type=submit class='btn btn-warning' >Apply Reset to Predicted</button></td>
+      </tr>
+    </table>
+</form>
+
+<div class="panel panel-default" style="margin: 30px 10px">
+  <div class="panel-heading">What will happen :</div>
+  <div class="panel-body">
+    This operation will change status of all validated and dubious objects matching the filter to Predicted.<br>
+    The previous classification will be added into the "classification change log" of the object.
+  </div>
+</div>

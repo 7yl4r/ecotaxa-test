@@ -1,0 +1,67 @@
+# To ensure all is installed and only them:
+# (venv)$ pip freeze | xargs pip uninstall -y
+# (venv)$ pip install -r requirements.txt
+
+# Typings there depend on SQLA 2.0 interface
+SQLAlchemy[mypy]==1.4.31
+# sqlalchemy2-stubs are now installed with [mypy] above
+sqlalchemy_views==0.3.1
+# When SQLAlchemy moves to 2.0 we'll be able to use psycopg3
+#psycopg[binary]==3.0.8
+psycopg2-binary==2.9.3
+# pgvector for similarity search
+pgvector==0.2.4
+# Image processing lib.
+# mac: brew install libjpeg
+Pillow==8.1.0
+# astral needs pytz
+astral==2.2
+pytz==2021.1
+types-pytz==2021.1.2
+# For image processing
+numpy~=1.19.2
+# Backbone of the app
+fastapi==0.73.0
+fastapi-utils==0.2.1
+# Last (April 2023) pydantic
+pydantic[mypy]==1.10.7
+# Speed up openapi response serialization
+orjson==3.6.6
+types-orjson==3.6.2
+#graphene==2.1.8
+uvloop==0.16.0
+httptools==0.2.0
+# With 0.16.0: Error "INFO:     ASGI 'lifespan' protocol appears unsupported." and the process
+# does not exit. Seen with 0.15.0 as well.
+# Note: there was a reg. in 0.17.0 with file upload, not visible during UT. So, to test manually.
+uvicorn==0.17.4
+gunicorn==21.2.0
+httpx==0.28.1
+lxml==4.6.3
+lxml-stubs==0.2.0
+requests==2.26.0
+types-requests==2.25.6
+python-multipart==0.0.5
+# Big files import lib - Needs fastapi>=0.110.0
+# tuspyserver==4.2.3
+# mime type for import
+magic-rs==0.2.0
+# Auth validation
+itsdangerous==2.0.1
+passlib==1.7.4
+# A bit of html
+jinja2==3.0.1
+aiofiles==0.7.0
+# Analyzis of XLSX data sources
+openpyxl==3.0.9
+openpyxl-stubs==0.1.21
+# DB upgrade
+alembic==1.7.5
+# CLI tools, for "cmds" subdirectory
+typer[all]==0.4.0
+# https://github.com/tiangolo/typer/issues/377
+click==8.0.4
+# More recent mypy
+mypy==1.2.0
+# OpenId lib, latest 1.6.6 Requires-Python >=3.9
+authlib==1.3.2

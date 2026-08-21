@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+
+import pytest
+from starlette import status
+from starlette.testclient import TestClient
+
+from API_operations.CRUD.Users import UserService
+from DB.User import UserQuality, User
+from tests.credentials import CREATOR_USER_ID, ADMIN_USER_ID
+from tests.test_fastapi import USER_ME_URL
+from tests.test_import import create_project
+
+LOGIN_URL = "/login"
+
+# Note we cannot use fastapi fixture here, as it skips auth for all other tests
+
+
+@pytest.fixture
+def client():
+    from main import app
+
+    return TestClient(app)
+
+
+def check_user_quality(user_id, expected_strong):
+    with UserService() as sce:
+        quality = (
+            sce.session.query(UserQuality)
+            .filter(UserQuality.user_id == user_id)
+            .first()
+        )
+        assert quality is not None
+        assert quality.password_strong is expected_strong
+
+
+# Don't use fastapi fixture as it tweaks security
+def test_plain_API_login(database, client):
+    url = LOGIN_URL
+    # Wrong params
+    rsp = client.post(url, data={"usernazme": "foo", "password": "bar"})
+    assert rsp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    # OK params, wrong values
+    rsp = client.post(url, json={"username": "foo", "password": "bar"})
+    assert rsp.status_code == status.HTTP_403_FORBIDDEN
+
+    # Plaintext password in DB
+    rsp = client.post(
+        url, json={"username": "administrator@email.test", "password": "ecotaxa"}
+    )
+    assert rsp.status_code == status.HTTP_200_OK
+    check_user_quality(ADMIN_USER_ID, False)
+
+    # Good password but inactive account
+    rsp = client.post(url, json={"username": "old_admin", "password": "nimda_dlo"})
+    assert rsp.status_code == status.HTTP_403_FORBIDDEN
+
+    # Crypted password in DB
+    rsp = client.post(url, json={"username": "creator", "password": "nimda"})
+    assert rsp.status_code == status.HTTP_200_OK
+    check_user_quality(CREATOR_USER_ID, False)
+
+    token = rsp.json()
+    # Token is quite random (that's good), so below is just a visual example
+    # assert token == "eyJ1c2VyX2lkIjoxfQ.X5PMDA.lUsgP1oSyJ4L_qtmoEBXlpd9lIk"
+    assert len(token) > 32
+
+    # Ensure that this entry point is not broken from security point of view
+    rsp = client.get(USER_ME_URL)
+    assert rsp.status_code == status.HTTP_403_FORBIDDEN
+
+    # Create a project, the creator becomes manager so he/she can create a taxon
+    prj_id = create_project(CREATOR_USER_ID, "Just for being here")
+
+    # Try the token with an authenticated API call
+    rsp = client.get(USER_ME_URL, headers={"Authorization": "Bearer " + token})
+    assert rsp.status_code == status.HTTP_200_OK
+    me_as_user = rsp.json()
+    del me_as_user["last_used_projects"]
+    del me_as_user["password"]
+    del me_as_user["mail_status_date"]
+    del me_as_user["status_date"]
+    del me_as_user["status_admin_comment"]
+    del me_as_user["orcid"]
+    assert me_as_user == {
+        "status": 1,
+        "country": None,
+        "email": "creator",
+        "id": 3,
+        "name": "User Creating Projects",
+        "organisation": "org3",
+        "usercreationdate": "2020-05-13T08:59:48.701060",
+        "usercreationreason": None,
+        "can_do": [1, 4],
+        "mail_status": None,
+    }
+
+    # Test strong password
+    with UserService() as sce:
+        from helpers.login import LoginService
+
+        with LoginService() as lsce:
+            lsce.pwd_context.hash("nimda")
+            # Update creator's password to a strong one
+            usr = sce.session.query(User).get(CREATOR_USER_ID)
+            usr.password = lsce.hash_password("StrongP@ssw0rd!")
+            sce.session.commit()
+
+    rsp = client.post(url, json={"username": "creator", "password": "StrongP@ssw0rd!"})
+    assert rsp.status_code == status.HTTP_200_OK
+    check_user_quality(CREATOR_USER_ID, True)

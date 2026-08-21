@@ -1,0 +1,4355 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+# Based on https://fastapi.tiangolo.com/
+#
+import os
+import re
+import time
+from logging import INFO
+from typing import Union, Tuple, List, Dict, Any, Optional
+
+from fastapi import (
+    FastAPI,
+    Request,
+    Header,
+    Response,
+    status,
+    Depends,
+    HTTPException,
+    UploadFile,
+    File,
+    Query,
+    Form,
+    Body,
+    Path,
+)
+from fastapi.logger import logger as fastapi_logger
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.templating import Jinja2Templates
+from fastapi_utils.timing import add_timing_middleware
+from sqlalchemy.sql.expression import null
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+
+from API_models.constants import Constants
+from API_models.crud import (
+    AcquisitionModel,
+    ProcessModel,
+    ProjectModel,
+    UserModelWithRights,
+    MinUserModel,
+    GuestModel,
+    OrganizationModel,
+    CollectionModel,
+    CollectionAggregatedRsp,
+    CreateCollectionReq,
+    CollectionReq,
+    SampleModel,
+    JobModel,
+    BulkUpdateReq,
+    CreateProjectReq,
+    ProjectReq,
+    ProjectTaxoStatsModel,
+    ProjectUserStatsModel,
+    ProjectSetColumnStatsModel,
+    ProjectColumnsModel,
+    SampleTaxoStatsModel,
+    ResetPasswordReq,
+    UserActivateReq,
+)
+from API_models.exports import (
+    ExportReq,
+    ExportRsp,
+    DarwinCoreExportReq,
+    GeneralExportReq,
+    SummaryExportReq,
+    BackupExportReq,
+)
+from API_models.filesystem import DirectoryModel
+from API_models.filters import ProjectFilters
+from API_models.helpers.Introspect import plain_columns
+from API_models.imports import ImportReq, SimpleImportRsp, SimpleImportReq, ImportRsp
+from API_models.login import LoginReq
+from API_models.merge import MergeRsp
+from API_models.misc import MigratedIDsRsp
+from API_models.objects import (
+    ObjectSetQueryRsp,
+    ObjectSetRevertToHistoryRsp,
+    ClassifyReq,
+    ObjectModel,
+    HistoricalClassificationModel,
+    ObjectSetSummaryRsp,
+    ClassifyAutoReq,
+    ClassifyAutoReqMult,
+    ObjectHeaderModel,
+)
+from API_models.prediction import (
+    PredictionRsp,
+    PredictionReq,
+    MLModel,
+    PredictionInfoRsp,
+)
+from API_models.simsearch import SimilaritySearchRsp
+from API_models.subset import SubsetReq, SubsetRsp
+from API_models.taxonomy import (
+    TaxaSearchRsp,
+    TaxonModel,
+    TaxonomyTreeStatus,
+    TaxonUsageModel,
+    TaxonCentral,
+    AddWormsTaxonModel,
+)
+from API_models.taxonomy import (
+    TaxoRecastRsp,
+    TaxoRecastSearchRsp,
+    TaxonomyRecastReq,
+)
+from API_operations.BigFiles import create_big_files_router
+from API_operations.CRUD.Collections import CollectionsService
+from API_operations.CRUD.Constants import ConstantsService
+from API_operations.CRUD.Guests import GuestService
+from API_operations.CRUD.Image import ImageService
+from API_operations.CRUD.Instruments import InstrumentsService
+from API_operations.CRUD.Jobs import JobCRUDService
+from API_operations.CRUD.Object import ObjectService
+from API_operations.CRUD.ObjectParents import (
+    SamplesService,
+    AcquisitionsService,
+    ProcessesService,
+)
+from API_operations.CRUD.Organizations import OrganizationService
+from API_operations.CRUD.Projects import ProjectsService
+from API_operations.CRUD.Users import UserService
+from API_operations.CommonFolder import CommonFolderService
+from API_operations.Consistency import ProjectConsistencyChecker
+from API_operations.DBSyncService import DBSyncService
+from API_operations.JsonDumper import JsonDumper
+from API_operations.Merge import MergeService
+from API_operations.MigratedIDs import MigratedIDsService
+from API_operations.ObjectManager import ObjectManager
+from API_operations.OpenID import router as openid_router, init_openid
+from API_operations.Prediction import PredictForProject, PredictionDataService
+from API_operations.SimilaritySearch import SimilaritySearchForProject
+from API_operations.Stats import ProjectStatsFetcher
+from API_operations.Status import StatusService
+from API_operations.Subset import SubsetServiceOnProject
+from API_operations.TaxoManager import CentralTaxonomyService
+from API_operations.TaxonomyService import TaxonomyService
+from API_operations.UserFilesFolder import UserFilesFolderService
+from API_operations.admin.Database import DatabaseService
+from API_operations.admin.ImageManager import ImageManagerService
+from API_operations.admin.NightlyJob import NightlyJobService
+from API_operations.exports.DarwinCore import DarwinCoreExport
+from API_operations.exports.ForProject import (
+    ProjectExport,
+    GeneralProjectExport,
+    SummaryProjectExport,
+    BackupProjectExport,
+)
+from API_operations.imports.Import import FileImport
+from API_operations.imports.SimpleImport import SimpleImport
+from BG_operations.JobScheduler import JobScheduler
+from BO.Classification import HistoricalClassification, ClassifIDT
+from BO.Collection import (
+    CollectionBO,
+    MinimalCollectionBO,
+)
+from BO.ColumnUpdate import ColUpdateList
+from BO.Job import JobBO
+from BO.Object import ObjectBO
+from BO.Project import ProjectBO, ProjectUserStats, ProjectColumns
+from BO.ProjectSet import ProjectSetColumnStats
+from BO.Sample import SampleTaxoStats
+from BO.Taxonomy import TaxonBO
+from BO.WoRMSification import WoRMSBO
+from DB import Sample
+from DB.Job import DBJobStateEnum
+from DB.Object import ObjectIDListT
+from DB.Project import ProjectTaxoStat, Project
+from DB.ProjectPrivilege import ProjectPrivilege
+from DB.TaxoRecast import RecastOperation
+from DB.User import GuestIDT, OrganizationIDT, User, UserIDT
+from helpers.AppConfig import Config
+from helpers.DynamicLogs import get_logger, get_api_logger, MONITOR_LOG_PATH
+from helpers.fastApiUtils import (
+    internal_server_error_handler,
+    dump_openapi,
+    get_current_user,
+    RightsThrower,
+    get_optional_current_user,
+    MyORJSONResponse,
+    ValidityThrower,
+    adjust_if_ranged,
+    regular_mem_cleanup,
+)
+from helpers.login import LoginService
+from helpers.pydantic import sort_and_prune, BaseModel
+
+# from fastapi.middleware.gzip import GZipMiddleware
+
+logger = get_logger(__name__)
+# TODO: A nicer API doc, see https://github.com/tiangolo/fastapi/issues/1140
+
+fastapi_logger.setLevel(INFO)
+
+api_logger = get_api_logger()
+
+app = FastAPI(
+    title="EcoTaxa",
+    version="0.0.48",
+    # openapi URL as seen from navigator, this is included when /docs is required
+    # which serves swagger-ui JS app. Stay in /api sub-path.
+    openapi_url="/api/openapi.json",
+    servers=[
+        {"url": "/api", "description": "External access"},
+        {"url": "/", "description": "Local access"},
+    ],
+    default_response_class=MyORJSONResponse,
+    # For later: Root path is in fact _removed_ from incoming requests, so not relevant here
+)
+
+init_openid()
+
+app.include_router(openid_router)
+
+# Instrument a bit
+add_timing_middleware(app, record=logger.info, prefix="app", exclude="untimed")
+
+app.add_middleware(
+    SessionMiddleware,
+    session_cookie="oid_session",
+    secret_key=Config().secret_key(),
+    same_site="lax",
+    https_only=False,
+)
+
+# 'Client disconnect kills running job' problem workaround. _Must_ be the _last_ added middleware in chain.
+# Update 08/03/2024: Bad diagnostic probably, workaround disabled.
+# app.add_middleware(SuppressNoResponseReturnedMiddleware)
+
+# Optimize large responses -> Let's leave this task to some proxy coded in C
+# app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+class FixLocationMiddleware(BaseHTTPMiddleware):
+    # Any redirect should point to the frontend, not the backend
+    FRONT_URL = Config().get_account_validation_url()
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        location = response.headers.get("location")
+        if location:
+            match = re.match(r"^http://[^/]+(/.*|$)", location)
+            if match:
+                path = match.group(1) or "/"
+                response.headers["location"] = f"{self.FRONT_URL}{path[1:]}"
+        return response
+
+
+app.add_middleware(FixLocationMiddleware)
+
+# HTML stuff
+# app.mount("/styles", StaticFiles(directory="pages/styles"), name="styles")
+templates = Jinja2Templates(directory=os.path.dirname(__file__) + "/pages/templates")
+# Below is useless if proxied by legacy app
+CDNs = " ".join(["cdn.datatables.net"])
+CRSF_header = {
+    "Content-Security-Policy": "default-src 'self' 'unsafe-inline' 'unsafe-eval' "
+    f"blob: data: {CDNs};frame-ancestors 'self';form-action 'self';"
+}
+
+# Establish second routes via /api to same app
+app.mount("/api", app)
+
+
+# noinspection PyUnusedLocal
+@app.post(
+    "/login",
+    operation_id="login",
+    tags=["authentification"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": "eyJ1c2VyX2lkIjo5OTN9.YUmHHw.-X4tsLsYbwldKL6vDgO3o4-aAxE"
+                }
+            }
+        }
+    },
+    response_model=str,
+)
+def login(params: LoginReq = Body(...)) -> str:
+    """
+    **Login barrier,**
+
+    If successful, the login will return a **JWT** which will have to be used
+    in bearer authentication scheme for subsequent calls.
+    """
+    with LoginService() as sce:
+        with RightsThrower():
+            ret = sce.validate_login(params.username, params.password)
+    return str(ret)
+
+
+@app.get(
+    "/users",
+    operation_id="get_users",
+    tags=["users"],
+    response_model=List[UserModelWithRights],
+)
+def get_users(
+    ids: str = Query(
+        "",
+        title="Ids",
+        description="String containing the list of one or more id separated by non-num char. \n"
+        " \n **If several ids are provided**, one full info is returned per user.",
+        example="1",
+    ),
+    fields: Optional[str] = Query(
+        default="*default",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[UserModelWithRights]:
+    """
+    Returns the list of **all users** with their full information, or just some of them if their ids
+    are provided.
+
+    🔒 *For admins only.*
+    """
+    with UserService() as sce:
+        usr_ids = _split_num_list(ids)
+        return sce.list(current_user, usr_ids, fields=fields)
+
+
+@app.get(
+    "/users/me",
+    operation_id="show_current_user",
+    tags=["users"],
+    response_model=UserModelWithRights,
+)
+def show_current_user(
+    current_user: int = Depends(get_current_user),
+) -> UserModelWithRights:
+    """
+    Returns **currently authenticated user's** (i.e. you) information, permissions and last used projects.
+    """
+    with UserService() as sce:
+        return sce.get_full_by_id(current_user, current_user)
+
+
+@app.put(
+    "/users/{user_id}",
+    operation_id="update_user",
+    tags=["users"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_user(
+    user: UserModelWithRights,
+    user_id: int = Path(
+        ..., description="Internal, numeric id of the user.", example=760
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the user**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator can change any field with respect of consistency.
+    - A user can update own password and name.
+    - An ordinary user cannot update anything for another user.
+    """
+    with UserService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.update_user(current_user, user_id, user)
+
+    with DBSyncService(User, User.id, user_id) as ssce:
+        ssce.wait()
+
+
+@app.post(
+    "/users/create",
+    operation_id="create_user",
+    tags=["users"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def create_user(
+    user: UserModelWithRights = Body(...),
+    no_bot: Optional[List[str]] = Query(
+        default=None,
+        title="NoBot token",
+        description="not-a-robot proof",
+        example="['127.0.0.1', 'ffqsdfsdf']",
+    ),
+    token: Optional[str] = Query(
+        default=None,
+        title="Token",
+        description="token in the url to validate request",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> None:
+    """
+    **Create a new user**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator can create a user.
+    - An unlogged user can self-create an account. But must eventually provide a no-robot proof.
+    - An ordinary logged user cannot create another account.
+
+    If back-end configuration for self-creation check is Google reCAPTCHA,
+    then no_bot is a pair [remote IP, reCAPTCHA response].
+    """
+    with UserService() as sce:
+        with ValidityThrower(), RightsThrower():
+            new_user_id: UserIDT = sce.create_user(current_user, user, no_bot, token)
+    with DBSyncService(User, User.id, new_user_id) as ssce:
+        ssce.wait()
+
+
+@app.get(
+    "/users/my_preferences/{project_id}",
+    operation_id="get_current_user_prefs",
+    tags=["users"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": '{"dispfield": " dispfield_orig_id dispfield_classif_auto_score dispfield_classif_when", "ipp": "1000", "magenabled": "1", "popupenabled": "1", "sortby": "orig_id", "sortorder": "asc", "statusfilter": "P", "zoom": "90"}'
+                }
+            }
+        }
+    },
+    response_model=str,
+)
+def get_current_user_prefs(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    key: str = Query(
+        ..., title="Key", description="The preference key, as text.", example="filters"
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Any:
+    """
+    **Returns one preference**, for a project and the currently authenticated user.
+
+    Available keys are **cwd**, **img_import** and **filters**.
+    """
+    with RightsThrower():
+        with UserService() as sce:
+            return sce.get_preferences_per_project(current_user, project_id, key)
+
+
+@app.put(
+    "/users/my_preferences/{project_id}",
+    operation_id="set_current_user_prefs",
+    tags=["users"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def set_current_user_prefs(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    key: str = Query(
+        ..., title="Key", description="The preference key, as text.", example="filters"
+    ),
+    value: str = Query(
+        ...,
+        title="Value",
+        description="The value to set this preference to, as text.",
+        example='{"dispfield": " dispfield_orig_id dispfield_classif_auto_score dispfield_classif_when dispfield_random_value", "ipp": "500", "magenabled": "1", "popupenabled": "1", "sortby": "orig_id", "sortorder": "asc", "statusfilter": "", "zoom": "90"}',
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Sets one preference**, for a project and for the currently authenticated user.
+
+    Available keys are **cwd**, **img_import** and **filters**.
+
+    The key disappears if set to empty string.
+
+    **Returns NULL upon success.**
+    """
+    with UserService() as sce:
+        return sce.set_preferences_per_project(current_user, project_id, key, value)
+
+
+@app.get(
+    "/users/search",
+    operation_id="search_user",
+    tags=["users"],
+    response_model=List[MinUserModel],
+)
+def search_user(
+    current_user: int = Depends(get_current_user),
+    by_name: Optional[str] = Query(
+        default=None,
+        title="search by name",
+        description="Search by name, use % for searching with 'any char'.",
+        example="%userNa%",
+    ),
+) -> List[User]:
+    """
+    **Search users using various criteria**, search is case-insensitive and might contain % chars.
+    """
+    with UserService() as sce:
+        ret = sce.search(current_user, by_name)
+    return ret
+
+
+@app.get(
+    "/users/admins",
+    operation_id="get_users_admins",
+    tags=["users"],
+    response_model=List[MinUserModel],
+)
+def get_users_admins() -> List[User]:
+    """
+    **List users administrators**, themselves being users.
+    🔒 Public, no auth.
+    """
+    with UserService() as sce:
+        ret = sce.get_users_admins()
+    return ret
+
+
+@app.get(
+    "/users/user_admins",
+    operation_id="get_admin_users",
+    tags=["users"],
+    response_model=List[MinUserModel],
+)
+def get_admin_users(current_user: int = Depends(get_current_user)) -> List[User]:
+    """
+    **List application administrators**, themselves being users.
+    🔒 Any authenticated user can access the list.
+    """
+    with UserService() as sce:
+        ret = sce.get_admin_users()
+    return ret
+
+
+@app.get(
+    "/users/{user_id}",
+    operation_id="get_user",
+    tags=["users"],
+    response_model=MinUserModel,
+)
+def get_user(
+    user_id: int = Path(
+        ..., description="Internal, the unique numeric id of this user.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Optional[User]:
+    """
+    Returns **information about the user** corresponding to the given id.
+    """
+    with UserService() as sce:
+        ret = sce.search_by_id(user_id)
+    if ret is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return ret
+
+
+#  activate a new user if external validation is on
+
+
+@app.post(
+    "/users/activate/{user_id}/{status}",
+    operation_id="activate_user",
+    tags=["users"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def activate_user(
+    user_id: int = Path(
+        ..., description="Internal, the unique numeric id of this user.", example=1
+    ),
+    status: str = Path(
+        ...,
+        description="Internal, the status name assign to this user.",
+        example=1,
+    ),
+    activatereq: UserActivateReq = Body(
+        ...,
+        description="activation parameters : reason if the request comes from an Administrator, password if the request comes from the user as it serves as email confirmation request.",
+    ),
+    no_bot: Optional[List[str]] = Query(
+        default=None,
+        title="NoBot",
+        description="not-a-robot proof",
+        example="['127.0.0.1', 'ffqsdfsdf']",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> None:
+    """
+    Activate a new user if external validation is on., return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator can activate a user or bypass the activation and inform the user when a modification request value/reason is provided.
+    - An ordinary logged user cannot activate another account.
+    If back-end configuration for self-creation check is Google reCAPTCHA,
+    then no_bot is a pair [remote IP, reCAPTCHA response].
+    """
+    with UserService() as sce:
+        sce.set_status_state_user(
+            user_id=user_id,
+            status_name=status,
+            current_user_id=current_user,
+            no_bot=no_bot,
+            activate_req=activatereq,
+        )
+
+
+# forgotten password - send a reset request mail
+@app.post(
+    "/users/reset_user_password",
+    operation_id="reset_user_password",
+    tags=["users"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def reset_user_password(
+    resetreq: ResetPasswordReq = Body(...),
+    no_bot: Optional[List[str]] = Query(
+        default=None,
+        title="NoBot token",
+        description="not-a-robot proof",
+        example="['127.0.0.1', 'ffqsdfsdf']",
+    ),
+    token: Optional[str] = Query(
+        default=None,
+        title="Token",
+        description="token in the url to validate request",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> None:
+    """
+    reset user password **return NULL on success**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator can reset a user password.
+    - An unlogged user can ask for a reset  in two steps. and receive a mail with a token. But must eventually provide a no-robot proof.
+
+    If back-end configuration for self-creation check is Google reCAPTCHA,
+    then no_bot is a pair [remote IP, reCAPTCHA response].
+    """
+    with UserService() as sce:
+        with ValidityThrower(), RightsThrower():
+            user_id = sce.reset_password(current_user, resetreq, no_bot, token)
+            if token and user_id != -1:
+                with DBSyncService(User, User.id, user_id) as ssce:
+                    ssce.wait()
+
+
+# ######################## END OF USER
+
+
+@app.get(
+    "/organizations/search",
+    operation_id="search_organizations",
+    tags=["organizations"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        "Oceanographic Laboratory of Villefranche sur Mer - LOV",
+                        "Developmental Biology Laboratory of Villefranche sur Mer - LBDV",
+                        "Sea Institute of Villefranche sur Mer - IMEV",
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[OrganizationModel],
+)
+def search_organizations(
+    name: str = Query(
+        ...,
+        title="Title",
+        description="Search by name, use % for searching with 'any char'.",
+        example="%vill%",
+    )
+) -> List[OrganizationModel]:
+    """
+    **Search for organizations.**
+    """
+    with OrganizationService() as sce:
+        org_names = sce.search_organizations(name)
+    return org_names
+
+
+@app.get(
+    "/organizations",
+    operation_id="get_organizations",
+    tags=["organizations"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        "Oceanographic Laboratory of Villefranche sur Mer - LOV",
+                        "Developmental Biology Laboratory of Villefranche sur Mer - LBDV",
+                        "Sea Institute of Villefranche sur Mer - IMEV",
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[OrganizationModel],
+)
+def get_organizations(
+    ids: str = Query(
+        "",
+        title="Ids",
+        description="String containing the list of one or more id separated by non-num char. \n"
+        " \n **If several ids are provided**, one full info is returned per user.",
+        example="1",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[OrganizationModel]:
+    """
+    **Search for organizations.**
+    """
+    with OrganizationService() as sce:
+        org_ids = _split_num_list(ids)
+        organizations = sce.list(current_user, org_ids)
+    return organizations
+
+
+@app.post(
+    "/organizations/create",
+    operation_id="create_organization",
+    tags=["organizations"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def create_organization(
+    organization: OrganizationModel = Body(...),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> OrganizationIDT:
+    """
+    **Create a new organization**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator or logged project manager can create an organization.
+    - An ordinary logged user cannot create another organization this way.
+    """
+    with OrganizationService() as sce:
+        with ValidityThrower(), RightsThrower():
+            org: OrganizationIDT = sce.create_organization(current_user, organization)
+    return org
+
+
+@app.put(
+    "/organizations/{organization_id}",
+    operation_id="update_organization",
+    tags=["organizations"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_organization(
+    organization: OrganizationModel,
+    organization_id: int = Path(
+        ..., description="Internal, numeric id of the organization.", example=760
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the organization**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator or manager user can change any field with respect of consistency.
+    """
+    with OrganizationService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.update_organization(current_user, organization_id, organization)
+
+
+# ######################## END OF ORGANIZATIONS
+
+
+@app.get(
+    "/guests",
+    operation_id="get_guests",
+    tags=["guests"],
+    response_model=List[GuestModel],
+)
+def get_guests(
+    ids: str = Query(
+        "",
+        title="Ids",
+        description="String containing the list of one or more id separated by non-num char. \n"
+        " \n **If several ids are provided**, one full info is returned per user.",
+        example="1",
+    ),
+    fields: Optional[str] = Query(
+        default="*default",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[GuestModel]:
+    """
+    Returns the list of **all guests** with their full information, or just some of them if their ids
+    are provided.
+
+    🔒 *For admins and managers only.*
+    """
+    with GuestService() as sce:
+        guest_ids = _split_num_list(ids)
+        return sce.list(current_user, guest_ids, fields=fields)
+
+
+@app.post(
+    "/guests/create",
+    operation_id="create_guest",
+    tags=["guests"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def create_guest(
+    guest: GuestModel = Body(...),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> GuestIDT:
+    """
+    **Create a new guest**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator or logged project manager can create a guest.
+    - An ordinary logged user cannot create another guest.
+
+    If back-end configuration for self-creation check is Google reCAPTCHA,
+    then no_bot is a pair [remote IP, reCAPTCHA response].
+    """
+    with GuestService() as sce:
+        with ValidityThrower(), RightsThrower():
+            new_guest: GuestIDT = sce.create_guest(current_user, guest)
+    return new_guest
+
+
+@app.put(
+    "/guests/{guest_id}",
+    operation_id="update_guest",
+    tags=["guests"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_guests(
+    guest: GuestModel,
+    guest_id: int = Path(
+        ..., description="Internal, numeric id of the guest.", example=760
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the guest**, return **NULL upon success.**
+
+    🔒 Depending on logged user, different authorizations apply:
+    - An administrator or user administrator or manager user can change any field with respect of consistency.
+    """
+    with GuestService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.update_guest(current_user, guest_id, guest)
+
+
+@app.get(
+    "/guests/search",
+    operation_id="search_guest",
+    tags=["guests"],
+    response_model=List[GuestModel],
+)
+def search_guest(
+    by_name: Optional[str] = Query(
+        default=None,
+        title="search by name",
+        description="Search by name, use % for searching with 'any char'.",
+        example="%userNa%",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[GuestModel]:
+    """
+    **Search guests using various criteria**, search is case-insensitive and might contain % chars.
+    """
+    with GuestService() as sce:
+        guests = sce.search(current_user, by_name)
+    ret: List = [
+        GuestModel(
+            id=guest.id,
+            name=guest.name,
+            email=guest.email,
+            orcid=guest.orcid,
+            country=guest.country,
+            organisation=guest.organisation,
+        )
+        for guest in guests
+    ]
+    return ret
+
+
+@app.get(
+    "/guests/{guest_id}",
+    operation_id="get_guest",
+    tags=["guests"],
+    response_model=GuestModel,
+)
+def get_guest(
+    guest_id: int = Path(
+        ..., description="Internal, the unique numeric id of this guest.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Optional[GuestModel]:
+    """
+    Returns **information about the user** corresponding to the given id.
+    """
+    with GuestService() as sce:
+        guest = sce.search_by_id(current_user, guest_id)
+    if guest is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return GuestModel(
+        id=guest.id,
+        name=guest.name,
+        email=guest.email,
+        orcid=guest.orcid,
+        country=guest.country,
+        organisation=guest.organisation,
+    )
+
+
+# ######################## END OF PERSONS
+
+
+@app.post(
+    "/collections/create",
+    operation_id="create_collection",
+    tags=["collections"],
+    responses={200: {"content": {"application/json": {"example": 1}}}},
+    response_model=int,
+)
+def create_collection(
+    params: CreateCollectionReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> Union[int, str]:
+    """
+    **Create a collection** with at least one project inside.
+
+    Returns the created collection Id.
+
+    Note: 'manage' right is required on all underlying projects.
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            ret = sce.create(current_user, params)
+    return ret
+
+
+@app.get(
+    "/collections",
+    operation_id="list_collections",
+    tags=["collections"],
+    response_model=List[CollectionModel],
+)
+def list_collections(
+    collection_ids: Optional[str] = Query(
+        default=None,
+        title="Collection Ids",
+        description="limit the list to a set of ids.",
+        example="123,45",
+    ),
+    fields: Optional[str] = Query(
+        default="*default",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),  # TODO: Unused param
+    current_user: int = Depends(get_current_user),
+) -> List[CollectionBO]:
+    """
+    **Search for collections.**
+
+    Note: Only collections where the current user is manager are returned. All collections are returned if the user is application administrator
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            matching_collections = sce.list(current_user, collection_ids)
+    return matching_collections
+
+
+@app.get(
+    "/collections/search",
+    operation_id="search_collections",
+    tags=["collections"],
+    response_model=List[CollectionModel],
+)
+def search_collections(
+    title: str = Query(
+        ...,
+        title="Title",
+        description="Search by title, use % for searching with 'any char'.",
+        example="%coll%",
+    ),
+    fields: Optional[str] = Query(
+        default="*default",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[CollectionBO]:
+    """
+    **Search for collections.**
+
+    Note: Only manageable collections are returned.
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            matching_collections = sce.search(current_user, title)
+    return matching_collections
+
+
+@app.get(
+    "/collections/by_title",
+    operation_id="collection_by_title",
+    tags=["collections"],
+    response_model=CollectionModel,
+)
+def collection_by_title(
+    q: str = Query(
+        ...,
+        title="Title",
+        description="Search by **exact** title.",
+        example="My collection",
+    )
+) -> CollectionBO:
+    """
+    Return the **single collection with this title**.
+
+    *For published datasets.*
+
+    ⚠️ DO NOT MODIFY BEHAVIOR ⚠️
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            matching_collection = sce.query_by_title(q)
+    return matching_collection
+
+
+@app.get(
+    "/collections/by_short_title",
+    operation_id="collection_by_short_title",
+    tags=["collections"],
+    response_model=CollectionModel,
+)
+def collection_by_short_title(
+    q: str = Query(
+        ...,
+        title="Short title",
+        description="Search by **exact** short title.",
+        example="My coll",
+    )
+) -> CollectionBO:
+    """
+    Return the **single collection with this short title**.
+
+    *For published datasets.*
+
+    ⚠️ DO NOT MODIFY BEHAVIOR ⚠️
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            matching_collection = sce.query_by_short_title(q)
+    return matching_collection
+
+
+@app.get(
+    "/collections/aggregated_projects_properties",
+    operation_id="collection_aggregated_projects_properties",
+    tags=["collections"],
+    responses={200: {"content": {"application/json": {"example": {}}}}},
+    response_model=CollectionAggregatedRsp,
+    response_class=MyORJSONResponse,
+)
+def collection_aggregated_projects_properties(
+    project_ids: str = Query(
+        ...,
+        title="Project Ids",
+        description="String containing the list of one or more project id separated by non-num char. \n .",
+        example="1",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> CollectionAggregatedRsp:
+    """
+    **returns projectset calculated selected fields values  projects and list of rejected projects id.
+    Note: 'manage' right is required on all underlying projects.
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            prj_ids = _split_num_list(project_ids)
+            ret = sce.aggregated_from_projects(current_user, prj_ids)
+    if isinstance(ret, str):
+        raise HTTPException(status_code=404, detail=ret)
+    # TODO: Mettre les syncs dans les services, moins dégeu
+    return ret
+
+
+@app.get(
+    "/collections/{collection_id}",
+    operation_id="get_collection",
+    tags=["collections"],
+    response_model=CollectionModel,
+)
+def get_collection(
+    collection_id: int = Path(
+        ...,
+        description="Internal, the unique numeric id of this collection.",
+        example=1,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> CollectionBO:
+    """
+    Returns **information about the collection** corresponding to the given id.
+
+    Note: The collection is returned only if manageable.
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            present_collection = sce.query(
+                current_user, collection_id, for_update=False
+            )
+        if present_collection is None:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        return present_collection
+
+
+@app.put(
+    "/collections/{collection_id}",
+    operation_id="update_collection",
+    tags=["collections"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_collection(
+    collection: CollectionReq = Body(...),
+    collection_id: int = Path(
+        ...,
+        description="Internal, the unique numeric id of this collection.",
+        example=1,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the collection**. Note that some updates are silently failing when not compatible
+     with the composing projects.
+
+     **Returns NULL upon success.**
+
+     Note: The collection is updated only if manageable.
+    """
+    collection_update = collection.dict()
+    with CollectionsService() as sce:
+        with RightsThrower():
+            sce.update(current_user, collection_id, collection_update)
+
+
+@app.patch(
+    "/collections/{collection_id}",
+    operation_id="patch_collection",
+    tags=["collections"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def patch_collection(
+    collection: CollectionReq = Body(...),
+    collection_id: int = Path(
+        ...,
+        description="Internal, the unique numeric id of this collection.",
+        example=1,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Partial Update of the collection**. Note that some updates are silently failing when not compatible
+     with the composing projects.
+
+     **Returns NULL upon success.**
+
+     Note: The collection is partiallly updated only if manageable.
+    """
+    collection_update = collection.dict(exclude_unset=True)
+    with CollectionsService() as sce:
+        with RightsThrower():
+            sce.update(current_user, collection_id, collection_update)
+
+
+@app.post(
+    "/collections/export/darwin_core",
+    operation_id="darwin_core_format_export",
+    tags=["collections"],
+    response_model=ExportRsp,
+)
+def darwin_core_format_export(
+    request: DarwinCoreExportReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> ExportRsp:
+    """
+    **Export the collection in Darwin Core format, e.g. for EMODnet portal**, @see https://www.emodnet-ingestion.eu
+
+    Produces a DwC-A (https://dwc.tdwg.org/) archive into a temporary directory, ready for download.
+
+    Maybe useful, a reader in Python: https://python-dwca-reader.readthedocs.io/en/latest/index.html
+
+    Note: Only manageable collections can be exported.
+    """
+
+    with DarwinCoreExport(
+        request.collection_id,
+        request.dry_run,
+        request.include_predicted,
+        request.with_absent,
+        request.with_computations,
+        request.extra_xml,
+        current_user,
+    ) as sce:
+        with ValidityThrower(), RightsThrower():
+            return sce.run()
+
+
+@app.delete(
+    "/collections/{collection_id}",
+    operation_id="erase_collection",
+    tags=["collections"],
+    responses={200: {"content": {"application/json": {"example": 0}}}},
+    response_model=int,
+)
+def erase_collection(
+    collection_id: int = Path(
+        ...,
+        description="Internal, the unique numeric id of this collection.",
+        example=1,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> int:
+    """
+    **Delete the collection**,
+
+    i.e. the precious fields, as the projects are just linked-at from the collection.
+
+    Note: Only manageable collections can be deleted.
+    """
+    with CollectionsService() as sce:
+        with RightsThrower():
+            return sce.delete(current_user, collection_id)
+
+
+# ######################## END OF COLLECTION
+
+MyORJSONResponse.register(ProjectBO, ProjectModel)
+MyORJSONResponse.register(User, UserModelWithRights)
+MyORJSONResponse.register(User, MinUserModel)
+MyORJSONResponse.register(TaxonBO, TaxonModel)
+MyORJSONResponse.register(WoRMSBO, TaxonModel)
+MyORJSONResponse.register(ObjectSetQueryRsp, ObjectSetQueryRsp)
+MyORJSONResponse.register(CollectionBO, CollectionModel)
+MyORJSONResponse.register(CollectionAggregatedRsp, CollectionAggregatedRsp)
+MyORJSONResponse.register(Sample, SampleModel)
+MyORJSONResponse.register(ProjectColumns, ProjectColumnsModel)
+project_model_columns = plain_columns(ProjectModel)
+
+
+# TODO JCE - description
+# TODO TODO TODO: No verification of GET query parameters by FastAPI. pydantic does POST models OK.
+@app.get(
+    "/projects",
+    operation_id="list_projects",
+    tags=["projects"],
+    response_model=List[ProjectModel],
+)
+async def list_projects(
+    current_user: Optional[int] = Depends(get_optional_current_user),
+    project_ids: Optional[str] = Query(
+        default=None,
+        title="Project Ids",
+        description="Limit the list to a set of ids.",
+        example="123,45",
+    ),
+    not_granted: bool = Query(
+        default=False,
+        title="Not granted",
+        description="Return projects on which the current user has _no permission_, but visible to him/her.",
+        example=False,
+    ),
+    for_managing: bool = Query(
+        default=False,
+        title="For managing",
+        description="Return projects that can be written to (including erased) by the current user.",
+        example=False,
+    ),
+    order_field: Optional[str] = Query(
+        default=None,
+        title="Order field",
+        description="One of %s" % list(project_model_columns.keys()),
+        example="instrument",
+    ),
+    fields: Optional[str] = Query(
+        default="*all",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),
+    window_start: Optional[int] = Query(
+        default=None,
+        title="Window start",
+        description="Skip `window_start` before returning data.",
+        example="0",
+    ),
+    window_size: Optional[int] = Query(
+        default=None,
+        title="Window size",
+        description="Return only `window_size` lines.",
+        example="100",
+    ),
+) -> MyORJSONResponse:  # List[ProjectBO]:
+    """
+    Returns **projects which the current user has explicit permission to access, with fields options.**
+
+    Note that, for performance reasons, in returned ProjectModels, field 'highest_rank' is NOT valued
+    (unlike in simple query). The same information can be found in 'managers', 'annotators' and 'viewers' lists.
+    """
+    with ProjectsService() as sce:
+        ret = sce.list(
+            current_user_id=current_user,
+            not_granted=not_granted,
+            for_managing=for_managing,
+            project_ids=project_ids,
+            order_field=order_field,
+            fields=fields,
+            window_start=window_start or 0,
+            window_size=window_size or 0,
+        )
+    # Pagination and sorting on genuine columns already happened in SQL above.
+    # This only covers derived/computed order fields that SQL can't sort on.
+    ret = sort_and_prune(ret, order_field, project_model_columns)
+    return MyORJSONResponse(ret)
+
+
+@app.get(
+    "/projects/search",
+    operation_id="search_projects",
+    tags=["projects"],
+    response_model=List[ProjectModel],
+)
+async def search_projects(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    current_user: Optional[int] = Depends(get_optional_current_user),
+    also_others: bool = Query(
+        default=False,
+        deprecated=True,
+        title="Also others",
+        description="",
+        example=False,
+    ),
+    not_granted: bool = Query(
+        default=False,
+        title="Not granted",
+        description="Return projects on which the current user has _no permission_, but visible to him/her.",
+        example=False,
+    ),
+    for_managing: bool = Query(
+        default=False,
+        title="For managing",
+        description="Return projects that can be written to (including erased) by the current user.",
+        example=False,
+    ),
+    title_filter: str = Query(
+        default="",
+        title="Title filter",
+        description="Use this pattern for matching returned projects names.",
+        example="Tara",
+    ),
+    instrument_filter: str = Query(
+        default="",
+        title="Instrument filter",
+        description="Only return projects where this instrument was used.",
+        example="uvp5",
+    ),
+    filter_subset: bool = Query(
+        default=False,
+        title="Filter subset",
+        description="Only return projects having 'subset' in their names.",
+        example=True,
+    ),
+    order_field: Optional[str] = Query(
+        default=None,
+        title="Order field",
+        description="One of %s" % list(project_model_columns.keys()),
+        example="instrument",
+    ),
+    fields: Optional[str] = Query(
+        default="*all",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). For users list display purpose.",
+        example="*default,fieldlist",
+    ),
+    window_start: Optional[int] = Query(
+        default=None,
+        title="Window start",
+        description="Skip `window_start` before returning data.",
+        example="0",
+    ),
+    window_size: Optional[int] = Query(
+        default=None,
+        title="Window size",
+        description="Return only `window_size` lines.",
+        example="100",
+    ),
+) -> MyORJSONResponse:  # List[ProjectBO]:
+    """
+    Returns **projects which the current user has explicit permission to access, with search options.**
+
+    Note that, for performance reasons, in returned ProjectModels, field 'highest_rank' is NOT valued
+    (unlike in simple query). The same information can be found in 'managers', 'annotators' and 'viewers' lists.
+    """
+    not_granted = not_granted or also_others
+    with ProjectsService() as sce:
+        ret = sce.search(
+            current_user_id=current_user,
+            not_granted=not_granted,
+            for_managing=for_managing,
+            title_filter=title_filter,
+            instrument_filter=instrument_filter,
+            filter_subset=filter_subset,
+            order_field=order_field,
+            fields=fields,
+            window_start=window_start,
+            window_size=window_size,
+        )
+    # Pagination and sorting on genuine columns already happened in SQL above.
+    # This only covers derived/computed order fields that SQL can't sort on.
+    ret = sort_and_prune(ret, order_field, project_model_columns)
+    return MyORJSONResponse(ret)
+
+
+@app.post(
+    "/projects/create",
+    operation_id="create_project",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": 44}}}},
+    response_model=int,
+)
+def create_project(
+    params: CreateProjectReq = Body(...), current_user: int = Depends(get_current_user)
+) -> Union[int, str]:
+    """
+    **Create an empty project with only a title,** and **return the numeric id of this newly created project**.
+
+    The project will be managed by current user.
+
+    🔒 The user has to be *app administrator* or *project creator*.
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            ret = sce.create(current_user, params)
+    if isinstance(ret, str):
+        raise HTTPException(status_code=404, detail=ret)
+    with DBSyncService(Project, Project.projid, ret) as ssce:
+        ssce.wait()
+    return ret
+
+
+@app.post(
+    "/projects/{project_id}/subset",
+    operation_id="project_subset",
+    tags=["projects"],
+    response_model=SubsetRsp,
+)
+def project_subset(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    params: SubsetReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> SubsetRsp:
+    """
+    **Subset a project into another one.**
+    """
+    with SubsetServiceOnProject(project_id, params) as sce:
+        with RightsThrower():
+            ret = sce.run(current_user)
+    return ret
+
+
+@app.get(
+    "/projects/{project_id}",
+    operation_id="project_query",
+    tags=["projects"],
+    response_model=ProjectModel,
+)
+def project_query(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    for_managing: Optional[bool] = Query(
+        title="For managing",
+        description="For managing this project.",
+        default=False,
+        example=False,
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> ProjectBO:
+    """
+    **Returns project** if it exists for current user, eventually for managing it.
+    """
+    with ProjectsService() as sce:
+        for_managing = bool(for_managing)
+        with RightsThrower():
+            ret = sce.query(current_user, project_id, for_managing, for_update=False)
+        return ret
+
+
+@app.get(
+    "/projects/{project_id}/collections",
+    operation_id="project_collections",
+    tags=["projects"],
+    response_model=List[MinimalCollectionBO],
+)
+def project_collections(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[MinimalCollectionBO]:
+    """
+    **Returns project collections list of id, title
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            ret = sce.in_collections(current_user, project_id)
+        return ret
+
+
+@app.get(
+    "/project_set/projects",
+    operation_id="project_set_get_projects",
+    tags=["projects"],
+    response_model=List[ProjectColumnsModel],
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+async def project_set_get_projects(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    ids: str = Query(
+        ...,
+        title="Ids",
+        description="String containing the list of one or more project id separated by non-num char. \n \n **If several ids are provided**, one stat record will be returned per project.",
+        example="1",
+    ),
+    fields: Optional[str] = Query(
+        default="*default",
+        title="Fields",
+        description="Return the default fields (typically used in conjunction with an additional field list). To return selected fields.",
+        example="*default,fieldlist",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> MyORJSONResponse:  # List[ProjectColumnsModel]
+    """
+    **Returns projects statistics**, i.e. used taxa and classification states.
+    """
+    with ProjectsService() as sce:
+        num_prj_ids = _split_num_list(ids)
+        with RightsThrower():
+            ret = sce.read_projects_columns(current_user, num_prj_ids, fields)
+    return MyORJSONResponse(ret)
+
+
+@app.get(
+    "/project_set/taxo_stats",
+    operation_id="project_set_get_stats",
+    tags=["projects"],
+    response_model=List[ProjectTaxoStatsModel],
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+async def project_set_get_stats(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    ids: str = Query(
+        ...,
+        title="Ids",
+        description="String containing the list of one or more project id separated by non-num char. \n \n **If several ids are provided**, one stat record will be returned per project.",
+        example="1",
+    ),
+    taxa_ids: str = Query(
+        title="Taxa Ids",
+        description="**If several taxa_ids are provided**, one stat record will be returned per requested taxa, if populated.\n \n **If taxa_ids is all**, all valued taxa in the project(s) are returned.",
+        default="",
+        example="all",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> MyORJSONResponse:  # List[ProjectTaxoStats]
+    """
+    **Returns projects statistics**, i.e. used taxa and classification states.
+    """
+    with ProjectsService() as sce:
+        num_prj_ids = _split_num_list(ids)
+        taxa_ids_call: Union[str, List[int]]
+        if taxa_ids == "all":
+            taxa_ids_call = taxa_ids
+        else:
+            taxa_ids_call = _split_num_list(taxa_ids)
+        with RightsThrower():
+            ret = sce.read_stats(current_user, num_prj_ids, taxa_ids_call)
+    return MyORJSONResponse(ret)
+
+
+@app.get(
+    "/project_set/user_stats",
+    operation_id="project_set_get_user_stats",
+    tags=["projects"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "projid": 1,
+                            "annotators": [{"id": 1267, "name": "User Name"}],
+                            "activities": [
+                                {
+                                    "id": 1267,
+                                    "nb_actions": 605,
+                                    "last_annot": "2021-09-27T13:08:54",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[ProjectUserStatsModel],
+)
+def project_set_get_user_stats(
+    ids: str = Query(
+        ...,
+        title="Ids",
+        description="String containing the list of one or more id separated by non-num char. \n \n **If several ids are provided**, one stat record will be returned per project.",
+        example="1",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[ProjectUserStats]:
+    """
+    **Returns projects user statistics**, i.e. a summary of the work done by users in the
+    required projects.
+
+    The returned values are a detail per project, so size of input list equals size of output list.
+    """
+    with ProjectsService() as sce:
+        num_ids = _split_num_list(ids)
+        with RightsThrower():
+            ret = sce.read_user_stats(current_user, num_ids)
+        return ret
+
+
+@app.get(
+    "/project_set/column_stats",
+    operation_id="project_set_get_column_stats",
+    tags=["projects"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "proj_ids": [1040, 4702],
+                        "total": 54169,
+                        "columns": ["classif", "obj.depth_min"],
+                        "counts": [54169, 54169],
+                        "variances": [1895031198.64, 0.000258],
+                    }
+                }
+            }
+        }
+    },
+    response_model=ProjectSetColumnStatsModel,
+)
+def project_set_get_column_stats(
+    ids: str = Query(
+        ...,
+        title="Project ids",
+        description="String containing the list of one or more id separated by non-num char.",
+        example="1400+1453",
+    ),
+    names: str = Query(
+        ...,
+        title="Column names",
+        description="Coma-separated prefixed columns, on which stats are needed.",
+        example="fre.area,obj.depth_min,fre.nb2",
+    ),
+    limit: Optional[int] = Query(
+        default=None,
+        title="Stats limit",
+        description="Only compute stats on this number of objects per category.",
+        example=5000,
+    ),
+    categories: Optional[str] = Query(
+        default=None,
+        title="Categories for limit",
+        description="String containing the Categories, one or more id separated by non-num char.",
+        example="493,567",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> ProjectSetColumnStats:
+    """
+    **Returns projects validated data statistics**, for all named columns, in all given projects.
+
+    The free columns here are named by the alias e.g. 'area', not technical name e.g. 'n43'.
+
+    This allows getting stats on projects with different mappings, but common names.
+    """
+    with ProjectsService() as sce:
+        num_ids = _split_num_list(ids)
+        if categories is not None:
+            classif_ids = _split_num_list(categories)
+        else:
+            classif_ids = []
+        name_list = names.split(",")
+        with RightsThrower():
+            ret = sce.read_columns_stats(
+                current_user, num_ids, name_list, limit, classif_ids
+            )
+        return ret
+
+
+@app.post(
+    "/projects/{project_id}/dump",
+    operation_id="project_dump",
+    tags=["projects"],
+    include_in_schema=False,
+)  # pragma:nocover
+def project_dump(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    filters: ProjectFilters = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    Dump the project in JSON form. Internal so far.
+    """
+    # TODO: Use a StreamingResponse to avoid buffering
+    with JsonDumper(current_user, project_id, filters.base()) as sce:
+        # TODO: Finish. lol.
+        import sys
+
+        return sce.run(sys.stdout)
+
+
+@app.post(
+    "/projects/{project_id}/merge",
+    operation_id="project_merge",
+    tags=["projects"],
+    response_model=MergeRsp,
+)
+def project_merge(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    source_project_id: int = Query(
+        ...,
+        title="Source project Id",
+        description="Id of the other project. All objects from this source project will be moved to the project_id above and the source project itself will be deleted.",
+        example=2,
+    ),
+    dry_run: bool = Query(
+        ...,
+        title="Dry run",
+        description="If set, then only a diagnostic of doability will be done.",
+        example=True,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> MergeRsp:
+    """
+    **Merge another project into this one.**
+
+    It's more a phagocytosis than a merge, as all objects from this source project will
+    be moved to the project_id above and the source project itself will be deleted.
+
+    TODO: Explain a bit with it might fail (too many free columns, unique orig_ids collision)
+    """
+    with MergeService(project_id, source_project_id, dry_run) as sce:
+        with RightsThrower():
+            return sce.run(current_user)
+
+
+@app.get(
+    "/projects/{project_id}/check",
+    operation_id="project_check",
+    tags=["projects"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        "Acquisition '765' is nested in several samples: [1234,7697]",
+                        "Acquisition '766' has no associated Process ",
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[str],
+)
+def project_check(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[str]:
+    """
+    **Check consistency of a project**.
+
+    With time and bugs, some consistency problems could be introduced in projects.
+    This service aims at listing them.
+    """
+    with ProjectConsistencyChecker(project_id) as sce:
+        with RightsThrower():
+            return sce.run(current_user)
+
+
+@app.get(
+    "/projects/{project_id}/stats",
+    operation_id="project_stats",
+    tags=["projects"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        "Project name",
+                        "OrderedDict([('lat_end', 'n01'), ('lon_end', 'n02')])",
+                        "(0):",
+                        "Total: 0 values, dup 0 values",
+                        "tot_rg20180314 (1): [43.685,43.685,#1,u1],[7.3156666667,7.3156666667,#1,u1],[9357,9357,#1,u1],[231.45,231.45,#1,u1],[10.249,10.249,#1,u1],[243,243,#1,u1],[179,179,#1,u1],[255,255,#1,u1],[171.59,171.59,#1,u1],[188.42,188.42,#1,u1],[171.2,171.2,#1,u1],[188.9,188.9,#1,u1],[3557.33,3557.33,#1,u1],[3932,3932,#1,u1],[698,698,#1,u1],[373,373,#1,u1],[350,350,#1,u1],[122.1,122.1,#1,u1],[97.6,97.6,#1,u1],[67.7,67.7,#1,u1],[0.009,0.009,#1,u1],[373.3,373.3,#1,u1],[2165655,2165655,#1,u1],[232,232,#1,u1],[-0.89,-0.89,#1,u1],[1.909,1.909,#1,u1],[4.94,4.94,#1,u1],[4196,4196,#1,u1],[698,698,#1,u1],[8895,8895,#1,u1],[1.336,1.336,#1,u1],[1766,1766,#1,u1],[1.359,1.359,#1,u1],[225,225,#1,u1],[231,231,#1,u1],[237,237,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[16,16,#1,u1],[26,26,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[0,0,#1,u1],[19.066,19.066,#1,u1],[19.122,19.122,#1,u1],[21,21,#1,u1],[21,21,#1,u1],[1441,1441,#1,u1],[86088,86088,#1,u1],[412.756,412.756,#1,u1],[4.556,4.556,#1,u1],[1,1,#1,u1],[109.1499080169,109.1499080169,#1,u1],[1.2448979592,1.2448979592,#1,u1],[76,76,#1,u1],[-0.4489990467,-0.4489990467,#1,u1],[1.4142135624,1.4142135624,#1,u1],[4.3205875999,4.3205875999,#1,u1],[13.1578947368,13.1578947368,#1,u1],[37.7147201027,37.7147201027,#1,u1],[3.9549031764,3.9549031764,#1,u1],[9.5361930295,9.5361930295,#1,u1],[29.1557377049,29.1557377049,#1,u1],[0.0088346243,0.0088346243,#1,u1],[0.0149948464,0.0149948464,#1,u1]",
+                        "Total: 69 values, dup 69 values",
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[str],
+)
+def project_stats(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[str]:
+    """
+    **Returns stats** for a project.
+
+    These stats will be returned as a list containing at index :
+    - 0 : The **title** of the project,
+    - 1 : A string containing all **freecols name and related column number**,
+
+    - 2 : **"(0):"**
+    - 3 :  **"Total: 0 values, dup 0 values"**
+
+    Then for each acquisition a pair of strings will be added to the list :
+    -  A string containing the **acquisition origin id** (the **number of objects for this acquisition**) : and then **small stats for an acquisition of a free column values inside** : [ min of values ; max of values ; distribution of the different values ; mode, i.e. freq of most frequent value]
+    -  A string containing the **number of total values** and the **number of duplicates values** "Total: ... values, dup ... values"
+
+    """
+    with ProjectStatsFetcher(project_id) as sce:
+        with RightsThrower():
+            return sce.run(current_user)
+
+
+@app.post(
+    "/projects/{project_id}/recompute_geo",
+    operation_id="project_recompute_geography",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def project_recompute_geography(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Recompute geography information** for all samples in project.
+
+    **Returns NULL upon success.**
+
+    🔒 The user has to be *project manager*.
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            sce.recompute_geo(current_user, project_id)
+
+
+@app.post(
+    "/projects/{project_id}/recompute_sunpos",
+    operation_id="project_recompute_sunpos",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def project_recompute_sunpos(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> int:
+    """
+    **Recompute sun position field** for all objects in project.
+
+    **Returns NULL upon success.**
+
+    🔒 The user has to be *project manager* on the referenced project.
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            return sce.recompute_sunpos(current_user, project_id)
+
+
+@app.post(
+    "/file_import/{project_id}",
+    operation_id="import_file",
+    tags=["projects"],
+    response_model=ImportRsp,
+)
+def import_file(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    params: ImportReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> ImportRsp:
+    """
+    **Validate or do a real import** of an EcoTaxa archive or directory.
+    """
+    with FileImport(project_id, params) as sce:
+        with RightsThrower():
+            ret = sce.run(current_user)
+    return ret
+
+
+@app.post(
+    "/simple_import/{project_id}",
+    operation_id="simple_import",
+    tags=["projects"],
+    response_model=SimpleImportRsp,
+)
+def simple_import(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    params: SimpleImportReq = Body(...),
+    dry_run: bool = Query(
+        ...,
+        title="Dry run",
+        description="If set, then only a diagnostic of doability will be done. In this case, plain value check. If no dry_run, this call will create a background job.",
+        example=True,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Optional[SimpleImportRsp]:
+    """
+    **Import images only**, with same metadata for all.
+    """
+    with SimpleImport(project_id, params, dry_run) as sce:
+        with RightsThrower():
+            ret = sce.run(current_user)
+    return ret
+
+
+@app.delete(
+    "/projects/{project_id}",
+    operation_id="erase_project",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": (100, 0, 10, 10)}}}},
+)
+def erase_project(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    only_objects: bool = Query(
+        title="Only objects",
+        description="If set, the project structure is kept, but emptied from any object, sample, acquisition and process.",
+        example=False,
+        default=False,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Tuple[int, int, int, int]:
+    """
+    **Delete the project.**
+
+    Optionally, if "only_objects" is set, the project structure is kept,
+    but emptied from any object, sample, acquisition and process.
+
+    Otherwise, no trace of the project will remain in the database.
+
+    **Returns** the number of  : **deleted objects**, 0, **deleated image rows** and **deleated image files**.
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            return sce.delete(current_user, project_id, only_objects)
+
+
+@app.put(
+    "/projects/{project_id}",
+    operation_id="update_project",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_project(
+    project: ProjectModel = Body(...),
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the project**, return **NULL upon success.**
+
+    Note that some fields will **NOT** be updated and simply ignored, e.g. *free_cols*.
+    """
+    assert project.title is not None, AssertionError("A valid Title is needed.")
+    with ProjectsService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.update(current_user, project_id, project)
+
+    with DBSyncService(Project, Project.projid, project_id) as ssce:
+        ssce.wait()
+    with DBSyncService(ProjectPrivilege, ProjectPrivilege.projid, project_id) as ssce:
+        ssce.wait()
+
+
+@app.patch(
+    "/projects/{project_id}",
+    operation_id="patch_project",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def patch_project(
+    project: ProjectReq = Body(...),
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the project**, return **NULL upon success.**
+
+    Note that some fields will **NOT** be updated and simply ignored, e.g. *free_cols*.
+    """
+    with ProjectsService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.patch(current_user, project_id, project)
+
+    with DBSyncService(Project, Project.projid, project_id) as ssce:
+        ssce.wait()
+    with DBSyncService(ProjectPrivilege, ProjectPrivilege.projid, project_id) as ssce:
+        ssce.wait()
+
+
+@app.put(
+    "/projects/{project_id}/prediction_settings",
+    operation_id="set_project_predict_settings",
+    tags=["projects"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def set_project_predict_settings(
+    settings: str = Query(
+        ...,
+        description="The new prediction settings.",
+        example="seltaxo=84963,59996,56545 baseproject=2562,2571",
+    ),
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=4223
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Update the project's prediction settings**, return **NULL upon success.**
+
+    🔒 Unlike during full project update above, which needs high permissions, this entry point is accessible
+    to **project annotators**, as it mirrors the prediction privileges.
+    """
+    with ProjectsService() as sce:
+        with RightsThrower():
+            sce.update_prediction_settings(current_user, project_id, settings=settings)
+
+    with DBSyncService(Project, Project.projid, project_id) as ssce:
+        ssce.wait()
+
+
+# ######################## END OF PROJECT
+
+
+@app.post(
+    "/object_set/{project_id}/similarity_search/{object_id}",
+    operation_id="get_object_set_similarity_search",
+    tags=["objects"],
+    response_model=SimilaritySearchRsp,
+)
+def object_similarity_search(
+    project_id: int = Path(
+        ...,
+        description="Internal, numeric id of the project to search in.",
+        example=3426,
+    ),
+    object_id: int = Path(
+        ..., description="Object ID to search similar for.", example=1040
+    ),
+    size: int = Query(
+        100,
+        description="Return at maximum this number of object IDs, by default 100.",
+        example="120",
+    ),
+    filters: ProjectFilters = Body(...),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> SimilaritySearchRsp:
+    """
+    Returns, in given project, the objects matching the filter and similar to the queried one.
+    """
+    with SimilaritySearchForProject(project_id, object_id, filters.base(), size) as sce:
+        sim_search_rsp = sce.similarity_search(current_user)
+
+    return sim_search_rsp
+
+
+@app.get(
+    "/samples/search",
+    operation_id="samples_search",
+    tags=["samples"],
+    response_model=List[SampleModel],
+)
+def samples_search(
+    project_ids: str = Query(
+        ...,
+        title="Project Ids",
+        description="String containing the list of one or more project id separated by non-num char.",
+        example="1,55",
+    ),
+    id_pattern: str = Query(
+        ...,
+        title="Pattern Id",
+        description="Sample id textual pattern. Use * or '' for 'any matches'. Match is case-insensitive.",
+        example="*",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[SampleModel]:
+    """
+    **Search for samples.**
+    """
+    with SamplesService() as sce:
+        proj_ids = _split_num_list(project_ids)
+        with RightsThrower():
+            ret = sce.search(current_user, proj_ids, id_pattern)
+        return [SampleModel.from_orm(sam) for sam in ret]
+
+
+@app.get(
+    "/sample_set/taxo_stats",
+    operation_id="sample_set_get_stats",
+    tags=["samples"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "nb_dubious": 56,
+                            "nb_predicted": 5500,
+                            "nb_unclassified": 0,
+                            "nb_validated": 1345,
+                            "sample_id": 192456,
+                            "used_taxa": [45072, 78418, 84963, 85011, 85012, 85078],
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[SampleTaxoStatsModel],
+)
+def sample_set_get_stats(
+    sample_ids: str = Query(
+        ...,
+        title="Sample Ids",
+        description="String containing the list of one or more sample ids separated by non-num char.",
+        example="15,5",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[SampleTaxoStats]:
+    """
+    Returns **classification statistics** for each sample of the given list. One block of stats is returned for each input ID.
+
+    EXPECT A SLOW RESPONSE : No cache of such information anywhere.
+    """
+    with SamplesService() as sce:
+        num_sample_ids = _split_num_list(sample_ids)
+        with RightsThrower():
+            ret = sce.read_taxo_stats(current_user, num_sample_ids)
+        return ret
+
+
+@app.post(
+    "/sample_set/update",
+    operation_id="update_samples",
+    tags=["samples"],
+    responses={200: {"content": {"application/json": {"example": 1}}}},
+    response_model=int,
+)
+def update_samples(
+    req: BulkUpdateReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    Do the required **update for each sample in the set.**
+
+    Any non-null field in the model is written to every impacted sample.
+
+    **Returns the number of updated entities.**
+    """
+    with SamplesService() as sce:
+        with RightsThrower():
+            return sce.update_set(
+                current_user, req.target_ids, ColUpdateList(req.updates)
+            )
+
+
+@app.get(
+    "/sample/{sample_id}",
+    operation_id="sample_query",
+    tags=["samples"],
+    response_model=SampleModel,
+)
+def sample_query(
+    sample_id: int = Path(
+        ..., description="Internal, the unique numeric id of this sample.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> SampleModel:
+    """
+    Returns **information about the sample** corresponding to the given id.
+    """
+    with SamplesService() as sce:
+        with RightsThrower():
+            ret = sce.query(current_user, sample_id)
+        if ret is None:
+            raise HTTPException(status_code=404, detail="Sample not found")
+        return SampleModel.from_orm(ret)
+
+
+# ######################## END OF SAMPLE
+
+
+@app.get(
+    "/acquisitions/search",
+    operation_id="acquisitions_search",
+    tags=["acquisitions"],
+    response_model=List[AcquisitionModel],
+)
+def acquisitions_search(
+    project_id: int = Query(
+        ..., title="Project id", description="The project id.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[AcquisitionModel]:
+    """
+    Returns the **list of all acquisitions for a given project**.
+    """
+    with AcquisitionsService() as sce:
+        with RightsThrower():
+            ret = sce.search(current_user, project_id)
+        return [AcquisitionModel.from_orm(acq) for acq in ret]
+
+
+@app.post(
+    "/acquisition_set/update",
+    operation_id="update_acquisitions",
+    tags=["acquisitions"],
+    responses={200: {"content": {"application/json": {"example": 2}}}},
+    response_model=int,
+)
+def update_acquisitions(
+    req: BulkUpdateReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    Do the required **update for each acquisition in the set**.
+
+    **Return the number of updated entities.**
+    """
+    with AcquisitionsService() as sce:
+        with RightsThrower():
+            return sce.update_set(
+                current_user, req.target_ids, ColUpdateList(req.updates)
+            )
+
+
+@app.get(
+    "/acquisition/{acquisition_id}",
+    operation_id="acquisition_query",
+    tags=["acquisitions"],
+    response_model=AcquisitionModel,
+)
+def acquisition_query(
+    acquisition_id: int = Path(
+        ...,
+        description="Internal, the unique numeric id of this acquisition.",
+        example=1,
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> AcquisitionModel:
+    """
+    Returns **information about the acquisition** corresponding to the given id.
+    """
+    with AcquisitionsService() as sce:
+        with RightsThrower():
+            ret = sce.query(current_user, acquisition_id)
+        if ret is None:
+            raise HTTPException(status_code=404, detail="Acquisition not found")
+        return AcquisitionModel.from_orm(ret)
+
+
+# ######################## END OF ACQUISITION
+
+
+@app.get(
+    "/instruments/",
+    operation_id="instrument_query",
+    tags=["instruments"],
+    response_model=List[str],
+    responses={
+        200: {"content": {"application/json": {"example": ["uvp5", "zooscan"]}}}
+    },
+)
+def instrument_query(
+    project_ids: str = Query(
+        ...,
+        title="Projects ids",
+        description="String containing the list of one or more project ids,"
+        " separated by non-num char, or 'all' for all instruments.",
+        example="1,2,3",
+    )
+) -> List[str]:
+    """
+    Returns the list of instruments, inside specific project(s) or globally.
+    """
+    with InstrumentsService() as sce:
+        prj_ids_call: Optional[List[int]]
+        if project_ids == "all":
+            prj_ids_call = None
+        else:
+            prj_ids_call = _split_num_list(project_ids)
+        with RightsThrower():
+            ret = sce.query(prj_ids_call)
+        return ret
+
+
+# ######################## END OF INSTRUMENT
+
+
+@app.post(
+    "/process_set/update",
+    operation_id="update_processes",
+    tags=["processes"],
+    responses={200: {"content": {"application/json": {"example": 1}}}},
+    response_model=int,
+)
+def update_processes(
+    req: BulkUpdateReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    Do the required **update for each process in the set.**
+
+    **Returns the number of updated entities.**
+    """
+    with ProcessesService() as sce:
+        with RightsThrower():
+            return sce.update_set(
+                current_user, req.target_ids, ColUpdateList(req.updates)
+            )
+
+
+@app.get(
+    "/process/{process_id}",
+    operation_id="process_query",
+    tags=["processes"],
+    response_model=ProcessModel,
+)
+def process_query(
+    process_id: int = Path(
+        ..., description="Internal, the unique numeric id of this process.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> ProcessModel:
+    """
+    Returns **information about the process** corresponding to the given id.
+    """
+    with ProcessesService() as sce:
+        with RightsThrower():
+            ret = sce.query(current_user, process_id)
+        if ret is None:
+            raise HTTPException(status_code=404, detail="Process not found")
+        return ProcessModel.from_orm(ret)
+
+
+# ######################## END OF PROCESS
+
+# TODO: Should be app.get, but for this we need a way to express
+#  that each field in ProjectFilter is part of the params
+
+# TODO /query pas bon!
+
+
+@app.post(
+    "/object_set/{project_id}/query",
+    operation_id="get_object_set",
+    tags=["objects"],
+    response_model=ObjectSetQueryRsp,
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+async def get_object_set(
+    # MyORJSONResponse -> JSONResponse -> Response -> await
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    filters: ProjectFilters = Body(...),
+    fields: Optional[str] = Query(
+        title="Fields",
+        description="""
+
+Specify the needed object (and ancillary entities) fields.
+
+It follows the naming convention 'prefix.field' : Prefix is either 'obj' for main object, 'fre' for free fields, 'img' for the visible image.
+
+The column obj.imgcount contains the total count of images for the object.
+
+Use a comma to separate fields.
+
+More help :
+
+You can get the field labels by parsing the classiffieldlist returned by a call to https://ecotaxa.obs-vlfr.fr/api/docs#/projects/project_query_projects__project_id__get.
+
+**Note that the following fields must be prefixed with the header "obj."** (for example → obj.orig_id):
+
+acquisid classif_auto_id, classif_auto_score, classif_auto_when, classif_crossvalidation_id,
+classif_id, classif_qual, classif_who, classif_when, complement_info, depth_max, depth_min,
+latitude, longitude, objdate, object_link, objid, objtime, orig_id, random_value, similarity, sunpos.
+
+**Note that the following fields must be prefixed with the header "img."** (for example → img.file_name):
+
+file_name, height, imgid, imgrank, file_name, objid, orig_file_name, thumb_file_name, thumb_height, thumb_width, width.
+
+**Note that the following fields must be prefixed with the header "txo."** (for example → txo.display_name):
+
+creation_datetime, creator_email, display_name, id, id_instance,aphia_id, lastupdate_datetime,
+name, nbrobj, nbrobjcum, parent_id, rename_to, source_desc, source_url, taxostatus, taxotype.
+
+**All other fields must be prefixed by the header "fre."** (for example → fre.circ.).
+                   """,
+        default=None,
+        example="obj.longitude,fre.feret",
+    ),
+    order_field: Optional[str] = Query(
+        title="Order field",
+        description='Order the result using given field. If prefixed with "-" then it will be reversed. '
+        "When using *special syntax ss-Innnn*, the order is similarity with given (by its ID) object.",
+        default=None,
+        example="obj.longitude",
+    ),
+    # TODO: order_field should be a user-visible field name, not nXXX, in case of free field
+    window_start: Optional[int] = Query(
+        default=None,
+        title="Window start",
+        description="""
+Allows to return only a slice of the result, by skipping window_start objects before returning data.
+If no **unique order** is specified, the result can vary for same call and conditions.""",
+        example="10",
+    ),
+    window_size: Optional[int] = Query(
+        default=None,
+        title="Window size",
+        description="""
+Allows to return only a slice of the result, by returning a _maximum_ of window_size lines.
+If no **unique order** is specified, the result can vary for same call and conditions.""",
+        example="100",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> MyORJSONResponse:
+    """
+    Returns **filtered object Ids** for the given project.
+    """
+    return_fields = None
+    if fields is not None:
+        return_fields = fields.split(",")
+
+    before = time.time()
+    with ObjectManager() as sce:
+        with RightsThrower():
+            rsp = ObjectSetQueryRsp()
+            obj_with_parents, details, total = sce.query(
+                current_user,
+                project_id,
+                filters.base(),
+                return_fields,
+                order_field,
+                window_start,
+                window_size,
+            )
+    rsp.total_ids = total
+    rsp.object_ids = [with_p[0] for with_p in obj_with_parents]
+    rsp.acquisition_ids = [with_p[1] for with_p in obj_with_parents]
+    rsp.sample_ids = [with_p[2] for with_p in obj_with_parents]
+    rsp.project_ids = [with_p[3] for with_p in obj_with_parents]
+    rsp.details = details
+    api_logger.info(
+        "ObjectSetQuery(prj=%s, flt=%s, ord=%s, ret=%s, winf=%s, wint=%s, seen_ms=%.2f)",
+        project_id,
+        filters.min_base(),
+        repr(order_field),
+        return_fields,
+        window_start,
+        window_size,
+        (time.time() - before) * 1000,
+    )
+    # Serialize
+    return MyORJSONResponse(rsp)
+
+
+@app.post(
+    "/object_set/{project_id:int}/summary",
+    operation_id="get_object_set_summary",
+    tags=["objects"],
+    response_model=ObjectSetSummaryRsp,
+)
+def get_object_set_summary(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    only_total: bool = Query(
+        ...,
+        title="Only total",
+        description="If True, returns only the **Total number of objects**. Else returns also the **Number of validated ones**, the **number of Dubious ones** and the number of **predicted ones**.",
+    ),
+    filters: ProjectFilters = Body(...),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> ObjectSetSummaryRsp:
+    """For the given project, with given filters, **return the classification summary**.
+
+    i.e.:
+
+    - Total number of objects
+
+    And optionally
+
+    - Number of Validated ones
+    - Number of Dubious ones
+    - Number of Predicted ones
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            rsp = ObjectSetSummaryRsp()
+            (
+                rsp.total_objects,
+                rsp.validated_objects,
+                rsp.dubious_objects,
+                rsp.predicted_objects,
+            ) = sce.summary(current_user, project_id, filters.base(), only_total)
+        return rsp
+
+
+@app.post(
+    "/object_set/{project_id}/reset_to_predicted",
+    operation_id="reset_object_set_to_predicted",
+    tags=["objects"],
+    response_model=None,
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def force_object_set_to_predicted(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    filters: ProjectFilters = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Force to Predicted** all objects for the given project with the filters.
+
+    Return **NULL upon success.**
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            return sce.force_to_predicted(current_user, project_id, filters.base())
+
+
+@app.post(
+    "/object_set/{project_id}/revert_to_history",
+    operation_id="revert_object_set_to_history",
+    tags=["objects"],
+    response_model=ObjectSetRevertToHistoryRsp,
+)
+def revert_object_set_to_history(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    filters: ProjectFilters = Body(...),
+    dry_run: bool = Query(
+        ...,
+        title="Dry run",
+        description="If set, then no real write but consequences of the revert will be replied.",
+        example=False,
+    ),
+    target: Optional[int] = Query(
+        title="Target",
+        description="Use null/None for reverting using the last annotation from anyone, or a user id for the last annotation from this user.",
+        default=None,
+        example=465,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> ObjectSetRevertToHistoryRsp:
+    """
+    **Revert all objects for the given project**, with the filters, to the target.
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            obj_hist, classif_info = sce.revert_to_history(
+                current_user, project_id, filters.base(), dry_run, target
+            )
+        ret = ObjectSetRevertToHistoryRsp(
+            last_entries=obj_hist, classif_info=classif_info
+        )
+    return ret
+
+
+@app.post(
+    "/object_set/{project_id}/reclassify",
+    operation_id="reclassify_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": 298}}}},
+    response_model=int,
+)
+def reclassify_object_set(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    filters: ProjectFilters = Body(...),
+    forced_id: ClassifIDT = Query(
+        ..., title="Forced Id", description="The new classification Id.", example=23025
+    ),
+    reason: str = Query(
+        ...,
+        title="Reason",
+        description="The reason of this new classification.",
+        example="W",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> int:
+    """
+    Regardless of present classification or state, **set the new classification for this object set.**
+
+    If the filter designates "all with given classification", add a TaxonomyChangeLog entry.
+
+    **Returns the number of affected objects.**
+    """
+    with ObjectManager() as sce:
+        with ValidityThrower(), RightsThrower():
+            nb_impacted = sce.reclassify(
+                current_user, project_id, filters.base(), forced_id, reason
+            )
+        return nb_impacted
+
+
+@app.post(
+    "/object_set/update",
+    operation_id="update_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": 2}}}},
+    response_model=int,
+)
+def update_object_set(
+    req: BulkUpdateReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    Do the required **update for each objects in the set.**
+
+    **Returns the number of updated entities.**
+
+    🔒 Current user needs *Manage* right on all projects of specified objects.
+
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            return sce.update_set(
+                current_user, req.target_ids, ColUpdateList(req.updates)
+            )
+
+
+@app.post(
+    "/object_set/classify",
+    operation_id="classify_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": 3}}}},
+    response_model=int,
+)
+def classify_object_set(
+    req: ClassifyReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    **Change classification and/or qualification for a set of objects.**
+
+    **Returns the number of updated entities.**
+
+    🔒 Current user needs at *least Annotate* right on all projects of specified objects.
+    """  ##**Returns the number of updated entities.**NULL upon success.
+    # TODO: Cannot classify anymore to deprecated taxon/category
+    assert len(req.target_ids) == len(
+        req.classifications
+    ), "Need the same number of objects and classifications"
+    with ObjectManager() as sce:
+        with RightsThrower():
+            ret, prj_id, changes = sce.classify_set(
+                current_user,
+                req.target_ids,
+                req.classifications,
+                req.wanted_qualification,
+            )
+        last_classif_ids = [
+            change[2] for change in changes.keys()
+        ]  # Recently used are in first
+        with UserService() as usce:
+            usce.update_classif_mru(current_user, prj_id, last_classif_ids)
+        with DBSyncService(ProjectTaxoStat, ProjectTaxoStat.projid, prj_id) as ssce:
+            ssce.wait()
+        return ret
+
+
+@app.post(
+    "/object_set/classify_auto",
+    operation_id="classify_auto_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": 3}}}},
+    response_model=int,
+)
+def classify_auto_object_set(
+    req: ClassifyAutoReq = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    **Set automatic classification** of a set of objects.
+
+    **Returns the number of updated entities.**
+    """
+    req2 = ClassifyAutoReqMult(
+        target_ids=req.target_ids,
+        classifications=[[a_classif] for a_classif in req.classifications],
+        scores=[[a_score] for a_score in req.scores],
+        keep_log=req.keep_log,
+    )
+    return classify_auto_mult_object_set(req2, current_user)
+
+
+@app.post(
+    "/object_set/classify_auto_multiple",
+    operation_id="classify_auto_mult_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": 3}}}},
+    response_model=int,
+)
+def classify_auto_mult_object_set(
+    req: ClassifyAutoReqMult = Body(...), current_user: int = Depends(get_current_user)
+) -> int:
+    """
+    **Set automatic classification** of a set of objects.
+
+    **Returns the number of updated entities.**
+    """
+    assert (
+        len(req.target_ids) == len(req.classifications) == len(req.scores)
+    ), "Need the same number of objects, classifications and scores"
+    assert all(
+        isinstance(score, float) and 0 <= score <= 1
+        for scores in req.scores
+        for score in scores
+    ), "Scores should be floats between 0 and 1"
+    with ObjectManager() as sce:
+        with RightsThrower():
+            ret, prj_id, changes = sce.classify_auto_mult_set(
+                current_user,
+                None,
+                req.target_ids,
+                req.classifications,
+                req.scores,
+            )
+        with DBSyncService(ProjectTaxoStat, ProjectTaxoStat.projid, prj_id) as ssce:
+            ssce.wait()
+        return ret
+
+
+# TODO: For small lists we could have a GET
+@app.post(
+    "/object_set/parents",
+    operation_id="query_object_set_parents",
+    tags=["objects"],
+    response_model=ObjectSetQueryRsp,
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+async def query_object_set_parents(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    object_ids: ObjectIDListT = Body(
+        ...,
+        title="Object IDs list",
+        description="The list of object ids.",
+        example=[634509, 6234516, 976544],
+    ),
+    current_user: int = Depends(get_current_user),
+) -> ObjectSetQueryRsp:
+    """
+    **Return object ids, with parent ones and projects** for the objects in given list.
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            rsp = ObjectSetQueryRsp()
+            obj_with_parents = sce.parents_by_id(current_user, object_ids)
+    rsp.object_ids = [with_p[0] for with_p in obj_with_parents]
+    rsp.acquisition_ids = [with_p[1] for with_p in obj_with_parents]
+    rsp.sample_ids = [with_p[2] for with_p in obj_with_parents]
+    rsp.project_ids = [with_p[3] for with_p in obj_with_parents]
+    rsp.total_ids = len(rsp.object_ids)
+    return rsp
+
+
+@app.post(
+    "/object_set/export",
+    operation_id="export_object_set",
+    tags=["objects"],
+    response_model=ExportRsp,
+)
+def export_object_set(
+    filters: ProjectFilters = Body(...),
+    request: ExportReq = Body(..., deprecated=True),
+    current_user: int = Depends(get_current_user),
+) -> ExportRsp:
+    """
+    ⚠️ Deprecated, see general, summary and backup exports for alternatives.
+
+    Start an export job for the given object set and options.
+
+    🔒 Current user needs *at least Read* right on the requested project.
+    """
+    with ProjectExport(request, filters.base()) as sce:
+        with RightsThrower():
+            rsp = sce.run(current_user)
+    return rsp
+
+
+@app.post(
+    "/object_set/export/general",
+    operation_id="export_object_set_general",
+    tags=["objects"],
+    response_model=ExportRsp,
+)
+def export_object_set_general(
+    filters: ProjectFilters = Body(...),
+    request: GeneralExportReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> ExportRsp:
+    """
+    Start a general-purpose export job for the given object set and options.
+
+    🔒 Current user needs *at least Read* right on the requested project.
+    """
+    with GeneralProjectExport(request, filters.base()) as sce:
+        with RightsThrower():
+            rsp = sce.run(current_user)
+    return rsp
+
+
+@app.post(
+    "/object_set/export/summary",
+    operation_id="export_object_set_summary",
+    tags=["objects"],
+    response_model=ExportRsp,
+)
+def export_object_set_summary(
+    filters: ProjectFilters = Body(...),
+    request: SummaryExportReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> ExportRsp:
+    """
+    Start a summary export job for the given object set and options.
+
+    🔒 Current user needs *at least Read* right on the requested project.
+    """
+    with SummaryProjectExport(request, filters.base()) as sce:
+        with RightsThrower():
+            rsp = sce.run(current_user)
+    return rsp
+
+
+@app.post(
+    "/object_set/export/backup",
+    operation_id="export_object_set_backup",
+    tags=["objects"],
+    response_model=ExportRsp,
+)
+def export_object_set_backup(
+    filters: ProjectFilters = Body(...),
+    request: BackupExportReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> ExportRsp:
+    """
+    Start a backup export job for the given object set and options.
+    If filters are empty, the produced zip will contain the full project.
+
+    🔒 Current user needs *at least Read* right on the requested project.
+    """
+    with BackupProjectExport(request, filters.base()) as sce:
+        with RightsThrower():
+            rsp = sce.run(current_user)
+    return rsp
+
+
+@app.post(
+    "/object_set/predict",
+    operation_id="predict_object_set",
+    tags=["objects"],
+    response_model=PredictionRsp,
+)
+def predict_object_set(
+    filters: ProjectFilters = Body(...),
+    request: PredictionReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> PredictionRsp:
+    """
+    **Start a prediction** AKA automatic classification for the given object set and options.
+    """
+    with PredictForProject(request, filters.base()) as sce:
+        rsp = sce.run(current_user)
+    return rsp
+
+
+@app.post(
+    "/object_set/predictions",
+    operation_id="object_set_predictions",
+    tags=["objects"],
+    response_model=PredictionInfoRsp,
+)
+def query_object_set_predictions(
+    object_ids: ObjectIDListT = Body(
+        ...,
+        title="Object IDs list",
+        description="The list of object ids.",
+        example=[634509, 6234516, 976544],
+    ),
+    current_user: int = Depends(get_current_user),
+) -> PredictionInfoRsp:
+    """
+    ** Return last prediction information for a set of objects, by their IDs.
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            rsp = sce.get_prediction_infos(current_user, object_ids)
+    return rsp
+
+
+@app.delete(
+    "/object_set/",
+    operation_id="erase_object_set",
+    tags=["objects"],
+    responses={200: {"content": {"application/json": {"example": (100, 0, 10, 10)}}}},
+)
+def erase_object_set(
+    object_ids: ObjectIDListT = Body(
+        ...,
+        title="Object IDs list",
+        description="The list of object ids.",
+        example=[634509, 6234516, 976544],
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Tuple[int, int, int, int]:
+    """
+    **Delete the objects with given object ids.**
+
+    **Returns** the number of  : **deleted objects**, 0, **deleated image rows** and **deleated image files**.
+
+    🔒 Current user needs *Manage* right on all projects of specified objects.
+    """
+    with ObjectManager() as sce:
+        with RightsThrower():
+            return sce.delete(current_user, object_ids)
+
+
+@app.get(
+    "/object/{object_id}",
+    operation_id="object_query",
+    tags=["object"],
+    response_model=ObjectModel,
+)
+def object_query(
+    object_id: int = Path(
+        ..., description="Internal, the unique numeric id of this object.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> ObjectBO:
+    """
+    Returns **information about the object** corresponding to the given id.
+
+    🔒 Anonymous reader can do if the project has the right rights :)
+    """
+    with ObjectService() as sce:
+        with RightsThrower():
+            ret = sce.query(current_user, object_id)
+        if ret is None:
+            raise HTTPException(status_code=404, detail="Object not found")
+        return ret
+
+
+@app.get(
+    "/object/{object_id}/history",
+    operation_id="object_query_history",
+    tags=["object"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "objid": 264409236,
+                            "classif_id": 82399,
+                            "classif_date": "2021-09-21T14:59:01.007110",
+                            "classif_who": "null",
+                            "classif_type": "A",
+                            "classif_qual": "P",
+                            "classif_score": 0.085,
+                            "user_name": "null",
+                            "taxon_name": "Penilia avirostris",
+                        },
+                        {
+                            "objid": 264409236,
+                            "classif_id": 25828,
+                            "classif_date": "2021-09-29T08:25:37.968095",
+                            "classif_who": 1267,
+                            "classif_type": "M",
+                            "classif_qual": "V",
+                            "classif_score": "null",
+                            "user_name": "User name",
+                            "taxon_name": "Copepoda",
+                        },
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[HistoricalClassificationModel],
+)
+def object_query_history(
+    object_id: int = Path(
+        ..., description="Internal, the unique numeric id of this object.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[HistoricalClassification]:
+    """
+    Returns **information about the object's history** corresponding to the given id.
+    """
+    with ObjectService() as sce:
+        with RightsThrower():
+            ret = sce.query_history(current_user, object_id)
+        if ret is None:
+            raise HTTPException(status_code=404, detail="Object not found")
+        return ret
+
+
+# ######################## END OF OBJECT
+
+
+@app.get(
+    "/taxa",
+    operation_id="query_root_taxa",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxonModel],
+)
+def query_root_taxa() -> List[TaxonBO]:
+    """
+    **Return all taxa with no parent.**
+    """
+    with TaxonomyService() as sce:
+        ret = sce.query_roots()
+        return ret
+
+
+@app.get(
+    "/taxa/status",
+    operation_id="taxa_tree_status",
+    tags=["Taxonomy Tree"],
+    response_model=TaxonomyTreeStatus,
+)
+def taxa_tree_status(
+    current_user: int = Depends(get_current_user),
+) -> TaxonomyTreeStatus:
+    """
+    **Return the status of taxonomy tree** w/r to freshness.
+    """
+    with TaxonomyService() as sce:
+        refresh_date = sce.status(_current_user_id=current_user)
+        return TaxonomyTreeStatus(
+            last_refresh=refresh_date.isoformat() if refresh_date else None
+        )
+
+
+@app.get(
+    "/taxa/reclassification_stats",
+    operation_id="reclassif_stats",
+    tags=["Taxonomy Tree"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "id": 12876,
+                            "renm_id": null,
+                            "name": "Echinodermata X",
+                            "type": "P",
+                            "nb_objects": 24,
+                            "nb_children_objects": 759,
+                            "display_name": "Echinodermata X",
+                            "lineage": [
+                                "Echinodermata X",
+                                "Echinodermata",
+                                "Metazoa",
+                                "Holozoa",
+                                "Opisthokonta",
+                                "Eukaryota",
+                                "living",
+                            ],
+                            "id_lineage": [12876, 11509, 2367, 382, 8, 2, 1],
+                            "children": [16710],
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    response_model=List[TaxonModel],
+)
+def reclassif_stats(
+    taxa_ids: str = Query(
+        ...,
+        title="Taxa ids",
+        description="String containing the list of one or more taxa id separated by non-num char.",
+        example="12876",
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[TaxonBO]:
+    """
+    Dig into reclassification logs and, for each input category id, **determine the most chosen target category,
+    excluding the advised one.**
+
+    By convention, if nothing relevant is found, the input category itself is returned. So one can expect
+    that the returned list has the same size as the required one.
+    """
+    with TaxonomyService() as sce:
+        num_taxa_ids = _split_num_list(taxa_ids)
+        with RightsThrower():
+            ret = sce.most_used_non_advised(current_user, num_taxa_ids)
+        return ret
+
+
+# TODO JCE
+@app.get(
+    "/taxa/reclassification_history/{project_id}",
+    operation_id="reclassif_project_stats",
+    tags=["Taxonomy Tree"],
+    response_model=List[Dict[str, Any]],
+)
+def reclassif_project_stats(
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[Dict[str, Any]]:
+    """
+    Dig into reclassification logs and **return the associations (source → target) for previous reclassifications.**
+    """
+    with TaxonomyService() as sce:
+        with RightsThrower():
+            ret = sce.reclassification_history(current_user, project_id)
+    return ret
+
+
+@app.get(
+    "/taxon/{taxon_id}",
+    operation_id="query_taxa",
+    tags=["Taxonomy Tree"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "id": 12876,
+                        "renm_id": null,
+                        "name": "Echinodermata X",
+                        "type": "P",
+                        "nb_objects": 24,
+                        "nb_children_objects": 759,
+                        "display_name": "Echinodermata X",
+                        "lineage": [
+                            "Echinodermata X",
+                            "Echinodermata",
+                            "Metazoa",
+                            "Holozoa",
+                            "Opisthokonta",
+                            "Eukaryota",
+                            "living",
+                        ],
+                        "id_lineage": [12876, 11509, 2367, 382, 8, 2, 1],
+                        "children": [16710],
+                    }
+                }
+            }
+        }
+    },
+    response_model=TaxonModel,
+)
+def query_taxa(
+    taxon_id: int = Path(
+        ..., description="Internal, the unique numeric id of this taxon.", example=12876
+    ),
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> Optional[TaxonBO]:
+    """
+    Returns **information about the taxon** corresponding to the given id, including its lineage.
+    """
+    with TaxonomyService() as sce:
+        ret: Optional[TaxonBO] = sce.query(taxon_id)
+    return ret
+
+
+@app.get(
+    "/taxon/{taxon_id}/usage",
+    operation_id="query_taxa_usage",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxonUsageModel],
+)
+def query_taxa_usage(
+    taxon_id: int = Path(
+        ..., description="Internal, the unique numeric id of this taxon.", example=12876
+    ),
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[Dict[str, Any]]:
+    """
+    **Where a given taxon is used.**
+
+    Only validated uses are returned.
+    """
+    with TaxonomyService() as sce:
+        ret = sce.query_usage(taxon_id)
+    return ret
+
+
+@app.get(
+    "/taxon_set/search",
+    operation_id="search_taxa",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxaSearchRsp],
+)
+def search_taxa(
+    query: str = Query(
+        ...,
+        description="Use this query for matching returned taxa names.",
+        example="Ban",
+    ),
+    project_id: Optional[int] = Query(
+        default=None, description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> List[TaxaSearchRsp]:
+    """
+    **Search for taxa by name.**
+
+    Queries can be 'small', i.e. of length ﹤3 and even zero-length.
+
+    🔓 For a public, unauthenticated call :
+    - zero-length and small queries always return nothing.
+    - otherwise, a full search is done and results are returned in alphabetical order.
+
+    🔒 For an authenticated call :
+    - zero-length queries: return the MRU list in full.
+    - small queries: the MRU list is searched, so that taxa in the recent list are returned, if matching.
+    - otherwise, a full search is done. Results are ordered so that taxa in the project list are in first,
+        and are signalled as such in the response.
+    """
+    with TaxonomyService() as sce:
+        ret = sce.search(current_user_id=current_user, prj_id=project_id, query=query)
+    return ret
+
+
+@app.get(
+    "/taxon_set/query",
+    operation_id="query_taxa_set",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxonModel],
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+async def query_taxa_set(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    ids: str = Query(
+        ...,
+        title="Ids",
+        description="The separator between numbers is arbitrary non-digit, e.g. ':', '|' or ','.",
+        example="1:2:3",
+    ),
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> MyORJSONResponse:  # List[TaxonBO]:
+    """
+    Returns **information about several taxa**, including their lineage.
+    """
+    num_ids = _split_num_list(ids)
+    with TaxonomyService() as sce:
+        ret = sce.query_set(num_ids)
+    return MyORJSONResponse(ret)
+
+
+@app.get(
+    "/taxon_set/wormsification",
+    operation_id="wormsification_taxa_set",
+    tags=["Taxonomy Tree"],
+    response_model=Dict[str, TaxonModel],
+    response_class=MyORJSONResponse,  # Force the ORJSON encoder
+)
+def wormsification_taxa_set(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    ids: str = Query(
+        ...,
+        title="Ids",
+        description="The separator between numbers is arbitrary non-digit, e.g. ':', '|' or ','.",
+        example="1:2:3",
+    ),
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> MyORJSONResponse:  # Dict[str,WoRMSBO]:
+    """
+    Returns **information about several taxa**, including their lineage.
+    """
+    num_ids = _split_num_list(ids)
+    with TaxonomyService() as sce:
+        ret = sce.wormsification_set(num_ids)
+    return MyORJSONResponse(ret)
+
+
+@app.get(
+    "/taxon/central/{taxon_id}",
+    operation_id="get_taxon_in_central",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxonCentral],
+)
+def get_taxon_in_central(
+    taxon_id: int = Path(
+        ..., description="Internal, the unique numeric id of this taxon.", example=12876
+    ),
+    _current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    Return **EcoTaxoServer full record for this taxon**.
+    """
+    with CentralTaxonomyService() as sce:
+        return sce.get_taxon_by_id(taxon_id)
+
+
+# TODO JCE - examples description
+# Below pragma is because we need the same params as EcoTaxoServer, but we just relay them
+# noinspection PyUnusedLocal
+@app.put("/taxon/central", operation_id="add_taxon_in_central", tags=["Taxonomy Tree"])
+def add_taxon_in_central(
+    name: str = Query(
+        ...,
+        title="Name",
+        description="The taxon/category verbatim name.",
+        example="Echinodermata",
+    ),
+    parent_id: int = Query(
+        ...,
+        title="Parent Id",
+        description="It's not possible to create a root taxon.",
+        example=2367,
+    ),
+    taxotype: str = Query(
+        ...,
+        title="Taxo Type",
+        description="The taxon type, 'M' for Morpho or 'P' for Phylo.",
+        example="P",
+    ),
+    creator_email: str = Query(
+        ...,
+        title="Creator email",
+        description="The email of the taxo creator.",
+        example="user.creator@email.com",
+    ),
+    request: Request = Query(..., title="Request", description=""),
+    source_desc: Optional[str] = Query(
+        default=None,
+        title="Source desc",
+        description="The source description.",
+        example="null",
+    ),
+    source_url: Optional[str] = Query(
+        default=None,
+        title="Source url",
+        description="The source url.",
+        example="http://www.google.fr/",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    **Create a taxon** on EcoTaxoServer.
+
+    🔒 Logged user must be manager (on any project) or application admin.
+    """
+    with CentralTaxonomyService() as sce:
+        # Clone params which are immutable
+        params = {k: v for k, v in request.query_params.items()}
+        return sce.add_taxon(current_user, params)
+
+
+@app.get(
+    "/taxa/stats/push_to_central",
+    operation_id="push_taxa_stats_in_central",
+    tags=["Taxonomy Tree"],
+)
+def push_taxa_stats_in_central(
+    _current_user: int = Depends(get_current_user),
+) -> Any:
+    """
+    **Push present instance stats**, into EcoTaxoServer.
+    """
+    with CentralTaxonomyService() as sce:
+        return sce.push_stats()
+
+
+@app.get(
+    "/taxa/pull_from_central",
+    operation_id="pull_taxa_update_from_central",
+    tags=["Taxonomy Tree"],
+)
+def pull_taxa_update_from_central(
+    _current_user: int = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    **Returns what changed in EcoTaxoServer managed tree** and update local tree accordingly.
+
+    i.e. : the number of inserts as nbr_inserts, updates as nbr_updates and errors as errors.
+    """
+    with CentralTaxonomyService() as sce:
+        ret: Dict[str, Any] = sce.pull_updates()
+    return ret
+
+
+@app.get(
+    "/worms/{aphia_id}",
+    operation_id="query_taxa_in_worms",
+    tags=["Taxonomy Tree"],
+    include_in_schema=False,
+    response_model=TaxonModel,
+)
+def query_taxa_in_worms(
+    aphia_id: int,
+    # = Path(..., description="Internal, the unique numeric id of this user.", default=None)
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> Optional[TaxonBO]:
+    """
+    Information about a single taxon in WoRMS reference, including its lineage. Deprecated, use EcoTaxa tree.
+    """
+    # with TaxonomyService() as sce:
+    #     ret: Optional[TaxonBO] = sce.query_worms(aphia_id)
+    return None
+
+
+@app.get(
+    "/searchworms/{name}",
+    operation_id="search_worms_name",
+    tags=["Taxonomy Tree"],
+    response_model=Optional[List[Dict]],  # type: ignore
+)
+def search_worms_name(
+    name: str,
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> Optional[List[Dict]]:
+    """
+    Information about a single taxon in WoRMS reference, including its lineage.
+    """
+    with CentralTaxonomyService() as sce:
+        ret = sce.search_worms_name(name)
+    return ret
+
+
+@app.post(
+    "/addworms/",
+    operation_id="add_worms_taxon",
+    tags=["Taxonomy Tree"],
+    response_model=Any,  # type: ignore
+)
+def add_worms_taxon(
+    taxon: AddWormsTaxonModel = Body(...),
+    _current_user: Optional[int] = Depends(get_optional_current_user),
+) -> Any:
+    """
+    Add worms taxon by its aphia_id
+    """
+    with CentralTaxonomyService() as sce:
+        with RightsThrower():
+            return sce.add_worms_taxon(taxon.aphia_id, _current_user)
+
+
+@app.put(
+    "/taxo_recast",
+    operation_id="update_taxonomy_recast",
+    tags=["Taxonomy Tree"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def update_taxonomy_recast(
+    recast: TaxonomyRecastReq = Body(...),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Create or Update the collection or project taxonomy recast**.
+     Note: The recast is updated only if manageable.
+    """
+    with TaxonomyService() as sce:
+        with ValidityThrower(), RightsThrower():
+            sce.update_taxonomy_recast(current_user, recast)
+
+
+@app.get(
+    "/taxo_recast",
+    operation_id="get_taxonomy_recast",
+    tags=["Taxonomy Tree"],
+    response_model=TaxoRecastRsp,
+)
+def get_taxonomy_recast(
+    target_id: int = Query(
+        ...,
+        description="Internal, the unique numeric id of this collection.",
+        example=1,
+    ),
+    operation: RecastOperation = Query(
+        default=None,
+        title="Operation name",
+        description="One of RecastOperation enum value",
+        example="dwca_export_occurrence",
+    ),
+    is_collection: bool = Query(
+        default=False,
+        title="Is a collection",
+        description="target_id refers to a collection_id or not",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Optional[TaxoRecastRsp]:
+    """
+    **Read the collection or project taxonomy recast**.
+     Note: The data is returned only if manageable.
+    """
+    with TaxonomyService() as sce:
+        with RightsThrower():
+            ret = sce.get_taxonomy_recast(
+                current_user_id=current_user,
+                target_id=target_id,
+                operation=operation,
+                is_collection=is_collection,
+            )
+    return ret
+
+
+@app.get(
+    "/taxo_recast/search",
+    operation_id="search_taxonomy_recast",
+    tags=["Taxonomy Tree"],
+    response_model=List[TaxoRecastSearchRsp],
+)
+def search_taxonomy_recast(
+    project_ids: Optional[str] = Query(
+        default=None,
+        description="Project ids to check, separated by ,. If not given, all"
+        " projects readable/administered by the current user are considered.",
+        example="1,2,3",
+    ),
+    operation: RecastOperation = Query(
+        ...,
+        title="Operation name",
+        description="One of RecastOperation enum value",
+        example="project_import",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[TaxoRecastSearchRsp]:
+    """
+    **Among given project_ids, return the existing taxonomy recast records for the
+    given operation**, each enriched with its project title. Note: only
+    administered/readable projects are considered. If project_ids is not given, all
+    projects readable/administered by the current user are considered.
+    """
+    ids = _split_num_list(project_ids) if project_ids else None
+    with TaxonomyService() as sce:
+        with RightsThrower():
+            ret = sce.search_taxonomy_recast(
+                current_user_id=current_user,
+                project_ids=ids,
+                operation=operation,
+            )
+    return ret
+
+
+@app.get(
+    "/taxo_worms",
+    operation_id="get_taxonomy_worms",
+    tags=["Taxonomy Tree"],
+    response_model=Dict[str, int],
+)
+def get_taxonomy_worms(
+    taxaids: str = Query(
+        title="Taxa Ids",
+        description="taxon id separated by ,",
+        default="",
+        example="all",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> Dict[str, int]:
+    """
+    **Read the collection or project taxonomy recast**.
+     Note: The data is returned only if manageable.
+    """
+    ids = _split_num_list(taxaids)
+    with TaxonomyService() as sce:
+        ret = sce.get_taxonomy_worms(
+            taxaids=ids,
+        )
+    return ret
+
+
+# ######################## END OF TAXA_REF
+
+
+@app.get(
+    "/admin/images/{project_id}/digest",
+    operation_id="digest_project_images",
+    tags=["WIP"],
+    include_in_schema=False,
+    response_model=str,
+)
+def digest_project_images(
+    max_digests: Optional[int],
+    project_id: int = Path(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    Compute digests for images referenced from a project.
+    """
+    max_digests = 1000 if max_digests is None else max_digests
+    with ImageManagerService() as sce:
+        with RightsThrower():
+            ret: str = sce.do_digests(current_user, project_id, max_digests)
+    return ret
+
+
+@app.get(
+    "/admin/images/cleanup1",
+    operation_id="cleanup_images_1",
+    tags=["WIP"],
+    include_in_schema=False,
+    response_model=str,
+)
+def cleanup_images_1(
+    project_id: int = Query(
+        ..., description="Internal, numeric id of the project.", example=1
+    ),
+    max_deletes: Optional[int] = None,
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    Remove duplicated images inside same object. Probably due to import update bug.
+    """
+    max_deletes = 10000 if max_deletes is None else max_deletes
+    with ImageManagerService() as sce:
+        with RightsThrower():
+            ret: str = sce.do_cleanup_dup_same_obj(
+                current_user, prj_id=project_id, max_deletes=max_deletes
+            )
+    return ret
+
+
+@app.get(
+    "/admin/nightly",
+    operation_id="nightly_maintenance",
+    tags=["WIP"],
+    include_in_schema=False,
+    response_model=str,
+)
+def nightly_maintenance(current_user: int = Depends(get_current_user)) -> int:
+    """
+    Do nightly cleanups and calculations.
+    """
+    with NightlyJobService() as sce:
+        with RightsThrower():
+            ret: int = sce.run(current_user)
+    return ret
+
+
+@app.get(
+    "/admin/monitor",
+    operation_id="activity_monitor",
+    tags=["MONITOR"],
+    include_in_schema=False,
+    response_model=str,
+)
+async def activity_monitor(
+    _current_user: int = Depends(get_current_user),
+) -> FileResponse:  # async due to FileResponse
+    """
+    Return some API endpoints activity log
+    """
+    return FileResponse(str(MONITOR_LOG_PATH))
+
+
+@app.get(
+    "/admin/db/query",
+    operation_id="db_direct_query",
+    tags=["admin"],
+    include_in_schema=True,
+    response_class=MyORJSONResponse,
+)
+async def direct_db_query(  # MyORJSONResponse -> JSONResponse -> Response -> await
+    q: str = Query(
+        ...,
+        title="Query",
+        description="The SQL to execute.",
+        example="select count(1) from objects",
+    ),
+    current_user: int = Depends(get_current_user),
+) -> MyORJSONResponse:
+    """
+    For making selects on the DB.
+    🔒 Admin only.
+    """
+    with DatabaseService() as sce:
+        with RightsThrower():
+            hdr, data = sce.execute_query(current_user, q)
+    ret = {"header": hdr, "data": data}
+    return MyORJSONResponse(ret)
+
+
+# ######################## END OF ADMIN
+
+
+@app.get(
+    "/jobs/", operation_id="list_jobs", tags=["jobs"], response_model=List[JobModel]
+)
+def list_jobs(
+    for_admin: bool = Query(
+        False,
+        title="For admin",
+        description="If FALSE return the jobs for current user, else return all of them.",
+        example=False,
+    ),
+    job_type: Optional[str] = Query(
+        None,
+        title="Job type",
+        description="The job type, e.g. FileImport, BackupExport, Prediction...",
+        example="import",
+    ),
+    job_status: Optional[DBJobStateEnum] = Query(
+        None,
+        title="Job status",
+        description="The job status: P(ending), R(unning), A(sking), E(rror), F(inished).",
+        example=DBJobStateEnum.Finished,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> List[JobBO]:
+    """
+    **Return the jobs** for current user, or all of them if admin is asked for.
+    Optional filters on type and status can be provided.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            ret: List[JobBO] = sce.list(current_user, for_admin, job_type, job_status)
+    return ret
+
+
+@app.get(
+    "/jobs/{job_id}/", operation_id="get_job", tags=["jobs"], response_model=JobModel
+)
+def get_job(
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    current_user: int = Depends(get_current_user),
+) -> JobBO:
+    """
+    Returns **information about the job** corresponding to the given id.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            ret: JobBO = sce.query(current_user, job_id)
+    return ret
+
+
+@app.post(
+    "/jobs/{job_id}/answer",
+    operation_id="reply_job_question",
+    tags=["jobs"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def reply_job_question(
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    reply: Dict[str, Any] = Body(default={}, title="Reply job question"),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Send answers to last question.** The job resumes after it receives the reply.
+
+    Return **NULL upon success.**
+
+    *Note: It's only about data storage here.*
+
+
+    If the data is technically NOK e.g. not a JS object, standard 422 error should be thrown.
+
+    If the data is incorrect from consistency point of view, the job will return in Asking state.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            sce.reply(current_user, job_id, reply)
+
+
+@app.get(
+    "/jobs/{job_id}/restart",
+    operation_id="restart_job",
+    tags=["jobs"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def restart_job(
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Restart the job related to the given id.**
+
+    Return **NULL upon success.**
+
+    🔒 The job must be in a restartable state, and be accessible to current user.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            sce.restart(current_user, job_id)
+
+
+@app.get("/jobs/{job_id}/log", operation_id="get_job_log_file", tags=["jobs"])
+async def get_job_log_file(  # async due to FileResponse
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    current_user: int = Depends(get_current_user),
+) -> FileResponse:
+    """
+    **Return the log file produced by given job.**
+
+    🔒 The job must be accessible to current user.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            path = sce.get_log_path(current_user, job_id)
+    return FileResponse(str(path))
+
+
+@app.get(
+    "/jobs/{job_id}/file",
+    operation_id="get_job_file",
+    tags=["jobs"],
+    responses={
+        200: {
+            "content": {"application/zip": {}, "text/tab-separated-values": {}},
+            "description": "Return the produced file.",
+        }
+    },
+)
+async def get_job_file(  # async due to StreamingResponse
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    current_user: int = Depends(get_current_user),
+    range_header: Optional[str] = Header(None, alias="Range"),
+) -> StreamingResponse:
+    """
+    **Return the file produced by given job.**
+
+    🔒 The job must be accessible to current user.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            file_like, file_name, media_type = sce.get_file_stream(current_user, job_id)
+    headers = {
+        "content-disposition": 'attachment; filename="' + file_name + '"',
+        "content-length": str(file_like.size()),
+        "accept-ranges": "bytes",
+    }
+    status_code = adjust_if_ranged(range_header, file_like, headers)
+    return StreamingResponse(
+        content=file_like,
+        status_code=status_code,
+        headers=headers,
+        media_type=media_type,
+    )
+
+
+@app.delete(
+    "/jobs/{job_id}",
+    operation_id="erase_job",
+    tags=["jobs"],
+    responses={200: {"content": {"application/json": {"example": null}}}},
+)
+def erase_job(
+    job_id: int = Path(
+        ..., description="Internal, the unique numeric id of this job.", example=47445
+    ),
+    current_user: int = Depends(get_current_user),
+) -> None:
+    """
+    **Delete the job** from DB, with associated storage.
+
+    Return **NULL upon success.**
+
+    If the job is running then kill it.
+
+    🔒 The job must be accessible to current user.
+    """
+    with JobCRUDService() as sce:
+        with RightsThrower():
+            sce.delete(current_user, job_id)
+
+
+# ######################## END OF JOBS
+
+
+# ####################### START OF COMMON FILES
+@app.get(
+    "/common_files/",
+    operation_id="list_common_files",
+    tags=["CommonFiles"],
+    response_model=DirectoryModel,
+)
+def list_common_files(
+    path: str = Query(
+        ..., title="path", description="", example="/ftp_plankton/Ecotaxa_Exported_data"
+    ),
+    current_user: int = Depends(get_current_user),
+) -> DirectoryModel:
+    """
+    **List the common files** which are usable for some file-related operations.
+
+    *e.g. import.*
+    """
+    with CommonFolderService() as sce:
+        with RightsThrower():
+            file_list = sce.list(path, current_user)
+    return file_list
+
+
+# ######################## END OF COMMON FILES
+# ######################## START OF USERS FILES
+@app.get(
+    "/user_files/{sub_path:path}",
+    operation_id="list_user_files",
+    tags=["MyFiles"],
+    response_model=DirectoryModel,
+)
+def list_user_files(
+    sub_path: str,  # = Query(..., title="Sub path", description="", example=""),
+    current_user: int = Depends(get_current_user),
+) -> DirectoryModel:
+    """
+    **List the private files** from user files directory  which are usable for some file-related operations.
+    A sub_path starting with "/" is considered relative to user folder.
+
+    *e.g. import.*
+    """
+    with UserFilesFolderService() as sce:
+        with RightsThrower():
+            file_list = sce.list(sub_path, current_user)
+    return file_list
+
+
+@app.post(
+    "/user_files/",
+    operation_id="post_user_file",
+    tags=["MyFiles"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": "/ftp_plankton/Ecotaxa_Data_to_import/uploadedFile.zip"
+                }
+            }
+        }
+    },
+    response_model=str,
+)
+async def put_user_file(  # async due to await file store
+    file: UploadFile = File(..., title="File", description=""),
+    path: Optional[str] = Form(
+        title="Path",
+        description="The destination path of the file.",
+        default=None,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    **Upload a file for the current user files directory.**
+
+    The returned text will contain a server-side path which is usable for some file-related operations.
+
+    *e.g. import.*
+    """
+    with UserFilesFolderService() as sce:
+        with ValidityThrower(), RightsThrower():
+            assert ".." not in str(path), "Forbidden"
+            file_name = await sce.store(current_user, file, path)
+    return file_name
+
+
+@app.post(
+    "/user_files/mv/",
+    operation_id="move_user_file",
+    tags=["MyFiles"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": "/ftp_plankton/Ecotaxa_Data_to_import/uploadedFile.zip"
+                }
+            }
+        }
+    },
+    response_model=str,
+)
+def move_user_file(  # async due to await file move
+    source_path: str = Form(
+        title="Source Path",
+        description="The  path of the file or directory to be moved.",
+        default=None,
+    ),
+    dest_path: str = Form(
+        title="Destination Path",
+        description="The path of the destination file or directory.",
+        default=None,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    **Move (or rename depending on source and dest path) a file or directory in the current user files directory.**
+    The returned text will contain a server-side path which is usable for some file-related operations.
+    """
+    with UserFilesFolderService() as sce:
+        with ValidityThrower(), RightsThrower():
+            assert ".." not in str(source_path), "Forbidden"
+            assert ".." not in str(dest_path), "Forbidden"
+            dest_path = sce.move(source_path, dest_path, current_user)
+    return dest_path
+
+
+@app.post(
+    "/user_files/rm/",
+    operation_id="remove_user_file",
+    tags=["MyFiles"],
+    responses={200: {"content": {"application/json": {"example": 0}}}},
+    response_model=int,
+)
+def remove_user_file(
+    source_path: str = Form(
+        title="Source Path",
+        description="The path of the file  or directory to be removed. * for all files and directories",
+        default=None,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> int:
+    """
+    **Remove a file, or directory in the current user files directory.**
+    """
+    with UserFilesFolderService() as sce:
+        with ValidityThrower(), RightsThrower():
+            assert ".." not in str(source_path), "Forbidden"
+            sce.remove(source_path, current_user)
+    return 1
+
+
+@app.post(
+    "/user_files/create/",
+    operation_id="create_user_file",
+    tags=["MyFiles"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": "/ftp_plankton/Ecotaxa_Data_to_import/uploadedFile.zip"
+                }
+            }
+        }
+    },
+    response_model=str,
+)
+async def create_user_file(  # async due to await file store
+    source_path: str = Form(
+        title="Source Path",
+        description="The path of the file or directory to be created.",
+        default=None,
+    ),
+    current_user: int = Depends(get_current_user),
+) -> str:
+    """
+    **Create a new file or directory in the current user files directory.**
+    The returned text will contain a server-side path which is usable for some file-related operations.
+    """
+    with UserFilesFolderService() as sce:
+        with ValidityThrower(), RightsThrower():
+            assert ".." not in str(source_path), "Forbidden"
+            new_path = sce.create(source_path, current_user)
+    return new_path
+
+
+# ######################## END OF USERS FILES
+
+system_status_resp = """Config dump:
+  secret_key: *************
+  db_user: postgres
+  db_password: *************
+  db_host: localhost
+  db_port: 5432
+  db_database: ecotaxa
+  ro_db_user: readerole
+  ro_db_password: *************
+  ro_db_host: localhost
+  ro_db_port: 5432
+  ro_db_database: ecotaxa
+  db_toolsdir: /usr/bin
+  sqlalchemy_database_uri: postgresql+psycopg2://+DB_USER+:+DB_PASSWORD+@+DB_HOST+/+DB_DATABASE+?application_name=ecotaxasqla
+  sqlalchemy_echo: False
+  sqlalchemy_pool_size: 50
+  security_password_hash: *************
+  security_password_salt: *************
+  security_changeable: True
+  security_post_change_view: /
+  security_send_password_change_email: *************
+  appmanager_email: marc.picheral@obs-vlfr.fr
+  appmanager_name: Marc Picheral
+  username: 'admin'
+  password: *************
+  thumbsizelimit: 400
+  serverloadarea: '/plankton_rw'
+  pythonexecutable: /home/ecotaxa/venv_ecotaxa/bin/python3
+  serverurl: https://ecotaxa.obs-vlfr.fr
+  part_default_visible_delay: 2
+  part_default_general_export_delay: 24
+  part_default_plankton_export_delay: 36
+  google_analytics_id: UA-100751107-1
+  recaptchaid: 6LcNbXgUAAAAAN683bG-gWlXDhZFyMBePp-SM6t8
+  recaptchasecret: *************
+  scn_enabled: True
+  scn_binary: /home/ecotaxa/ecotaxa/SCN_networks/ecotaxa
+  ftpexportarea: '/plankton_rw/ftp_plankton/Ecotaxa_Exported_data'
+  taxoserver_url: http://ecotaxoserver.obs-vlfr.fr
+  taxoserver_instance_id: 1
+  taxoserver_shared_secret: *************
+Paths:
+  /plankton_rw (from serverloadarea): OK
+  /plankton_rw/ftp_plankton/Ecotaxa_Exported_data (from ftpexportarea): OK"""
+
+
+@app.get(
+    "/status",
+    operation_id="system_status",
+    tags=["WIP"],
+    responses={200: {"content": {"application/json": {"example": system_status_resp}}}},
+)
+def system_status(
+    current_user: Optional[int] = Depends(get_optional_current_user),
+) -> Response:
+    """
+    **Report the status**, mainly used for verifying that the server is up.
+    Depending on provided credentials, you get more or less information.
+    """
+    with StatusService() as sce:
+        return Response(sce.run(current_user), media_type="text/plain")
+
+
+# ######################## END OF WIP
+
+
+@app.get("/error", operation_id="system_error", tags=["misc"])
+def system_error(_current_user: int = Depends(get_current_user)) -> None:
+    """
+    **Return a 500 internal error**, on purpose so the stack trace is visible and client
+    can see what it gives.
+    """
+    with RightsThrower():
+        assert False
+
+
+@app.get(
+    "/noop",
+    operation_id="do_nothing",
+    tags=["misc"],
+    response_model=Union[ObjectHeaderModel, HistoricalClassificationModel],  # type: ignore
+)
+def do_nothing(_current_user: int = Depends(get_current_user)):
+    """
+    **This entry point will just do nothing.**
+
+    It's also used for exporting models we need on client side.
+    """
+
+
+@app.get(
+    "/constants", operation_id="used_constants", tags=["misc"], response_model=Constants
+)
+def used_constants() -> Constants:
+    """
+    **Return useful strings for user dialog.**
+
+    Now also used for values extracted from Config.
+    """
+    with ConstantsService() as sce:
+        return sce.get()
+
+
+@app.get(
+    "/ml_models",
+    operation_id="query_ml_models",
+    tags=["misc"],
+    response_model=List[MLModel],
+)
+def query_ml_models() -> List[MLModel]:
+    """
+    **Return the list of machine learning models, which can be used for extracting image features.**
+    """
+    with PredictionDataService() as sce:
+        models = sce.get_models()
+    return [MLModel(name=a_model) for a_model in models]
+
+
+@app.get(
+    "/migrated_ids",
+    operation_id="get_migrated_ids",
+    tags=["misc"],
+    response_model=MigratedIDsRsp,
+)
+def get_migrated_ids(
+    projects: str = Query(
+        "",
+        title="Project IDs",
+        description="String containing the list of one or more project ids separated by non-num char.",
+        example="1,2,3",
+    ),
+    samples: str = Query(
+        "",
+        title="Sample IDs",
+        description="String containing the list of one or more sample ids separated by non-num char.",
+        example="1,2,3",
+    ),
+    acquisitions: str = Query(
+        "",
+        title="Acquisition IDs",
+        description="String containing the list of one or more acquisition ids separated by non-num char.",
+        example="1,2,3",
+    ),
+    objects: str = Query(
+        "",
+        title="Object IDs",
+        description="String containing the list of one or more object ids separated by non-num char.",
+        example="1,2,3",
+    ),
+) -> MigratedIDsRsp:
+    """
+    **Return migrated IDs from old IDs.**
+    """
+    proj_ids = _split_num_list(projects)
+    sam_ids = _split_num_list(samples)
+    acq_ids = _split_num_list(acquisitions)
+    obj_ids = _split_num_list(objects)
+    with MigratedIDsService() as sce:
+        return sce.get_migrated_ids(proj_ids, sam_ids, acq_ids, obj_ids)
+
+
+# ######################## END OF MISC
+
+
+@app.get(
+    "/vault/{dir_id}/{img_in_dir}",
+    operation_id="get_image",
+    tags=["image"],
+    include_in_schema=False,
+)
+async def get_image(  # async due to StreamingResponse
+    dir_id: str = Path(
+        ...,
+        description="Internal, image directory ID, 0-padded if < 1000.",
+        example="0123",
+    ),
+    img_in_dir: str = Path(
+        ..., description="Internal, image path in directory.", example="0075.jpg"
+    ),
+) -> StreamingResponse:
+    """
+    Stream a vault image by its ref.
+    """
+    with ImageService() as sce:
+        file_like, length, media_type = sce.get_stream(dir_id, img_in_dir)
+    headers = {"content-length": str(length)}
+    return StreamingResponse(file_like, headers=headers, media_type=media_type)
+
+
+# ######################## END OF MISC
+
+# @app.get("/loadtest", tags=['WIP'], include_in_schema=False)
+# def load_test() -> Response:
+#     """
+#         Simulate load with various response time. The Service() gets a session from the DB pool.
+#         See if we just wait or fail to serve:
+#         httperf --server=localhost --port=8000 --uri=/loadtest --num-conns=1000 --num-calls=10
+#     """
+#     with StatusService() as sce:
+#     import time
+#     time.sleep(random()/10)
+#     return Response(sce.run(), media_type="text/plain")
+
+app.add_exception_handler(
+    status.HTTP_500_INTERNAL_SERVER_ERROR, internal_server_error_handler
+)
+
+dump_openapi(app, __file__)
+
+# Can be overwritten for testing
+# Note: in PROD there are 16 workers, statistically the jobs will start very fast
+JOB_INTERVAL = 5
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    # Small service construction & check, to ensure config and the DB are OK
+    with ConstantsService() as sce:
+        sce.config.validate()
+
+    # The router for big files needs a valid USERSFILESAREA config
+    app.include_router(create_big_files_router())
+
+    # Clean memory every minute
+    JobScheduler.todo_on_idle = regular_mem_cleanup
+    # Don't run predictions, they are left to a specialized runner
+    JobScheduler.FILTER = [PredictForProject.JOB_TYPE]
+    JobScheduler.launch_at_interval(JOB_INTERVAL)
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    JobScheduler.shutdown()
+
+
+def _split_num_list(ids: str) -> List[int]:
+    # Find first non-num char, decide it's a separator
+    for c in ids:
+        if c not in "0123456789":
+            sep = c
+            break
+    else:
+        sep = ","
+    num_ids = [int(x) for x in ids.split(sep) if x.isdigit()]
+    return num_ids

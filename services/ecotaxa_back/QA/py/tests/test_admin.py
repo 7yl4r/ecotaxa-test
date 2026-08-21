@@ -1,0 +1,79 @@
+import logging
+
+from API_operations.helpers.Service import Service
+from starlette import status
+
+from tests.api_wrappers import api_wait_for_stable_job, api_get_log_file
+from tests.credentials import ADMIN_AUTH, USER_AUTH
+from tests.jobs import check_job_ok
+from tests.test_import import do_import_uvp6
+
+PROJECT_DIGEST_URL = "/admin/images/{project_id}/digest?max_digests=100"
+NIGHTLY_URL = "/admin/nightly"
+
+
+def test_admin_images(fastapi):
+
+    prj_id, _ = do_import_uvp6(fastapi, "Test Project Admin")
+
+    url = PROJECT_DIGEST_URL.format(project_id=prj_id)
+
+    # Simple user cannot
+    rsp = fastapi.get(url, headers=USER_AUTH)
+    assert rsp.status_code == status.HTTP_403_FORBIDDEN
+
+    # Admin can
+    rsp = fastapi.get(url, headers=ADMIN_AUTH)
+    assert rsp.status_code == status.HTTP_200_OK
+    assert rsp.json() == "Digest for 30 images done."
+
+    # TODO: some common error cases
+
+    # md5 is persisted
+    rsp = fastapi.get(url, headers=ADMIN_AUTH)
+    assert rsp.status_code == status.HTTP_200_OK
+    assert rsp.json() == "Digest for 0 images done."
+
+
+def do_nightly(fastapi):
+    rsp = fastapi.get(NIGHTLY_URL, headers=ADMIN_AUTH)
+    assert rsp.status_code == status.HTTP_200_OK
+
+    job_id = rsp.json()
+    job = api_wait_for_stable_job(fastapi, job_id)
+    log = api_get_log_file(fastapi, job.id)
+    if any(":ERROR" in line for line in log):
+        print(log)
+    check_job_ok(job)
+    return log
+
+
+def test_nightly_job(fastapi, caplog, tstlogs):
+    # TODO: Not a real test, as we can't know in advance when the test runs, so the output
+    # can't be verified against a reference.
+
+    from test_export import test_export_roundtrip
+
+    # Generate a few jobs however, and warp them back in time
+    test_export_roundtrip(fastapi, tstlogs)  # Import/Export/Import
+    with Service() as sce:
+        sce.session.execute(
+            "update job set creation_date='2022-06-01' where id in (select id from job order by id desc limit 3)"
+        )
+        sce.session.commit()
+
+    # Simple user cannot
+    rsp = fastapi.get(NIGHTLY_URL, headers=USER_AUTH)
+    assert rsp.status_code == status.HTTP_403_FORBIDDEN
+
+    # Only Admin can
+    caplog.set_level(logging.DEBUG)
+
+    log = do_nightly(fastapi)
+    msgs = len([line for line in log if "About to clean 3 jobs" in line])
+    assert msgs > 0
+
+    # Second cleanup must do nothing
+    log = do_nightly(fastapi)
+    msgs = len([line for line in log if "About to clean 0 jobs" in line])
+    assert msgs > 0

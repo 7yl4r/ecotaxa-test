@@ -1,0 +1,46 @@
+<div class="container block h-full relative mx-auto mt-16 md:mt-24 lg:48  md:pt-8 ">{%- if homepage and homepage.value is mapping and "message" in homepage.value -%}
+<div class="homepage js js-addtags bg-gradient-to-b  from-transparent to-mainblue-50 font-normal py-4 pt-10 px-8 mx-2 my-8" id="homepage-homepage"><div class="inline-block mx-auto w-auto ">{{homepage.value["message"]["content"].replace('\n','<br>')|string()|safe}}</div></div>
+{%-endif-%}<div class="grid grid-rows-3 md:grid-cols-3 md:grid-rows-1 gap-4 mx-2" id="homeSelectors">
+  	<!-- For explore -->
+        <div class="md:mr-4 flex flex-col">
+        <a href="/explore/" class="button bg-gradient-to-r hover:bg-gradient-to-l from-mainblue-700 to-mainblue-500 border-none shadow-sm hover:shadow-none  text-stone-50  block w-full text-center">{{_('Explore images')}}</a>
+        <div class="mt-2 p-4 pt-2 text-sm border-r bg-gradient-to-t  from-transparent to-mainblue-50 shadow flex-grow">
+          <p>{{_('As a visitor, you have free access to a subset of the images that have been already identified by users.')}}</p>
+          <p>{{_(' Images can be filtered according to several criteria: taxonomy, geographic location, depth, date and time of sampling, and imaging instrument.')}}</p>
+        </div>
+        </div><!-- For projects -->
+        <div class="md:mr-4 flex flex-col">
+        <a href="{{url_for('gui_prj')}}" class="button bg-gradient-to-r hover:bg-gradient-to-l  from-mainblue-500 to-mainblue-700 border-none shadow-sm hover:shadow-none text-stone-50 hover:bg-mainblue-500 block w-full text-center">{{_('Contribute to a project')}}</a>
+        <div class="mt-2 p-4 pt-2 text-sm border-r bg-gradient-to-b  from-transparent to-mainblue-50 background-register shadow flex-grow">
+          <p>{{_('You can contribute to the richness of this image database and/or to the collaborative taxonomic annotation effort.Images are organised in projects which should be consistent in terms of sampling and imaging techniques.  We provide tools to support the quick annotation of large image datasets, such as supervised machine learning prediction and visual similarity search.')}}</p>
+        </div>
+        </div><!-- For collections -->
+        <div class="flex flex-col">
+        <a href="{{url_for('gui_collection')}}" class="button bg-gradient-to-r hover:bg-gradient-to-l  from-mainblue-700 to-mainblue-500 border-none shadow-sm hover:shadow-none text-stone-50 hover:bg-mainblue-500 block w-full text-center">{{_('Browse the collections')}}{{badge('success',_('new'),False,True)}}</a>
+        <div class="mt-2 p-4 pt-2 text-sm border-r bg-gradient-to-b  from-transparent to-mainblue-50 shadow flex-grow">
+          <p>{{_('A collection is a set of similar projects that can be explored together (legs of a cruise, years of a time series, etc.) or a single project that constitutes a full dataset.')}}<br>
+              {{_('After adding metadata and choosing a license, the data is ready to be exported and published in DarwinCore archive format, <a href="https://obis.org/" class="text-mainblue-700 hover:text-secondblue-400">OBIS</a> or <a href="https://www.gbif.org/" class="text-mainblue-700 hover:text-secondblue-400">GBIF</a>.')}}
+          </p>
+        </div>
+        </div>
+    </div><div class="flex flex-row">
+      <div class="my-6 mx-2 p-8 pt-6 text-sm shadow  bg-gradient-to-b  from-transparent to-mainblue-50 basis-1/2">
+          <p>{{_('The')}} <a href="{{ecopart_url()}}" title="EcoPart - {{ecopart_url()}}" class="text-lg font-medium text-mainblue-700 hover:text-secondblue-400 bg-transparent shadow-none border-none text-center">EcoPart</a> {{_('application is designed to manage data from Underwater Vision Profiler (UVP) instruments.')}}
+          <br>{{_(' It allows:')}}
+      <ul class="list-square list-inside ml-4"><li>{{_('Importing particle data and linking them with CTD data and zooplankton images annotated in Ecotaxa.')}}</li>
+        <li>{{ _('Computing size spectra from particle data.')}}</li>
+      <li>{{ _('Downloading particle spectra, CTD data, and zooplankton records based on user permissions.')}}</li></ul>
+           {{ _('EcoPart also provides simple data visualization and facilitates data sharing.')}}</p>
+        </div><div class="my-6 mx-2 p-8 pt-6 text-sm shadow bg-gradient-to-b  from-transparent to-mainblue-50 basis-1/2">{{_('In addition to the Ecotaxa application, the new <a href="https://ecotaxoguide.imev-mer.fr/" class="text-lg font-medium text-mainblue-700 hover:text-secondblue-400 bg-transparent shadow-none border-none text-center">EcoTaxoGuide</a> application explains how to taxonomically classify images acquired through various instruments and how to disambiguate similar-looking objects. These will become available directly from EcoTaxa in the future
+This is a beta version and improvements are ongoing.')}}{{_('We have already filled the information for many taxa seen on ZooScan images and have begun for images of the UVP and Flowcam/Planktoscope.If you do not find your taxon/instrument of interest, you can register and create it. Be sure to read the embedded HOW TO page first and please contact piqv@imev-mer.fr for better coordination.
+
+We hope that this resource will prove useful!')}}</div></div>
+
+    <div id="disclaimer" class="text-xs p-4 mb-12 ">
+<p>{{_('EcoTaxa is not responsible for the safekeeping of the images and data it stores. Even if the application managers make their best to secure them. We advise you to perform your own backups.')}}</p>
+<p>{{_('People annotating images in EcoTaxa cannot claim for any retribution but they can download and use the results of their work. The application can be freely downloaded and installed for scientific usage.')}}
+</p>
+<p>{{_('If you use EcoTaxa in your work, we would appreciate that you cite it as: Picheral M, Colin S, Irisson J-O. EcoTaxa, a tool for the taxonomic classification of images. http://ecotaxa.obs-vlfr.fr')}}</p>
+<p>{{_('For any problem please contact <a href="mailto:piqv@imev-mer.fr">piqv@imev-mer.fr</a>.')}}</p>
+<p>{{_('EcoTaxa has been developped thanks to the <a href="/gui/about">support of many organisations and projects</a>.')}}</p>
+</div></div>

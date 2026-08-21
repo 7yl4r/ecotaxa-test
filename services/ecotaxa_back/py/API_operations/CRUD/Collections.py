@@ -1,0 +1,222 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+from typing import List, Union, Optional, Dict, Any
+
+from fastapi import HTTPException
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
+
+from API_models.crud import CreateCollectionReq, CollectionAggregatedRsp
+from BO.Collection import CollectionBO, CollectionIDT
+from BO.Project import CollectionProjectBOSet
+from BO.ProjectSet import PermissionConsistentProjectSet
+from BO.Rights import NOT_FOUND
+from DB.Collection import Collection
+from DB.Project import ProjectIDListT
+from DB.User import UserIDT
+from helpers.DynamicLogs import get_logger
+from helpers.httpexception import DETAIL_EXCLUSIVE_CREATOR_ASSOCIATE
+from ..helpers.Service import Service
+
+logger = get_logger(__name__)
+
+DETAIL_COLLECTION_PUBLISHED = "Collection is published"
+
+
+class CollectionsService(Service):
+    """
+    Basic CRUD operations on Collections
+    """
+
+    def create(
+        self, current_user_id: UserIDT, req: CreateCollectionReq
+    ) -> Union[CollectionIDT, str]:
+        """
+        Create a collection.
+        """
+        PermissionConsistentProjectSet(
+            self.session, req.project_ids
+        ).can_be_administered_by(current_user_id)
+        coll_id = CollectionBO.create(self.session, req.title, req.project_ids)
+        if isinstance(coll_id, str):
+            raise HTTPException(
+                status_code=422, detail=coll_id + "\n Collection not created"
+            )
+        return coll_id
+
+    def update(
+        self,
+        current_user_id: UserIDT,
+        collection_id: CollectionIDT,
+        req: Dict[str, Any],
+    ):
+        """
+        Update a collection.
+        """
+        if "project_ids" in req:
+            PermissionConsistentProjectSet(
+                self.session, req["project_ids"]
+            ).can_be_administered_by(current_user_id)
+        present_collection = self.query(current_user_id, collection_id, for_update=True)
+        if present_collection is None:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        self._exclusive_creator_associate(req)
+        res = present_collection.update(session=self.session, collection_update=req)
+        if isinstance(res, str):
+            raise HTTPException(
+                status_code=422, detail=res + "\n Collection not updated"
+            )
+
+    def list(
+        self, current_user_id: UserIDT, collection_ids: Optional[str] = None
+    ) -> List[CollectionBO]:
+        qry = self.ro_session.query(Collection)
+        if collection_ids is not None:
+            ids = collection_ids.split(",")
+            if len(ids) > 0:
+                qry = qry.where(Collection.id.in_(ids))
+        ret = []
+        for a_rec in qry:
+            coll_bo = CollectionBO(a_rec)
+            coll_bo._read_composing_projects()
+            checked = self._check_permission(current_user_id, coll_bo.project_ids)
+            if checked is None:
+                continue
+            coll_bo.enrich()
+            ret.append(coll_bo)
+        return ret
+
+    def search(self, current_user_id: UserIDT, title: str) -> List[CollectionBO]:
+        qry = self.ro_session.query(Collection).filter(Collection.title.ilike(title))
+        ret = []
+        for a_rec in qry:
+            coll_bo = CollectionBO(a_rec)
+            coll_bo._read_composing_projects()
+            checked = self._check_permission(current_user_id, coll_bo.project_ids)
+            if checked is None:
+                continue
+            coll_bo.enrich()
+            ret.append(coll_bo)
+        return ret
+
+    def query(
+        self, current_user_id: UserIDT, coll_id: CollectionIDT, for_update: bool
+    ) -> Optional[CollectionBO]:
+        ret = CollectionBO.get_one(
+            self.session if for_update else self.ro_session, coll_id
+        )
+        if ret is None:
+            return ret
+        check = self._check_permission(current_user_id, ret.project_ids)
+        if check is None:
+            return None
+        return ret
+
+    def query_by_title(self, title: str) -> CollectionBO:
+        # Return a unique collection from its title
+        qry = self.ro_session.query(Collection).filter(Collection.title == title)
+        ret = [CollectionBO(a_rec).enrich() for a_rec in qry]
+        assert len(ret) == 1, NOT_FOUND
+        return ret[0]
+
+    def query_by_short_title(self, title: str) -> CollectionBO:
+        # Return a unique collection from its title, short one
+        qry = self.ro_session.query(Collection).filter(Collection.short_title == title)
+        ret = [CollectionBO(a_rec).enrich() for a_rec in qry]
+        assert len(ret) == 1, NOT_FOUND
+        return ret[0]
+
+    def delete(self, current_user_id: UserIDT, coll_id: CollectionIDT) -> int:
+        collection = self.query(current_user_id, coll_id, for_update=True)
+        assert collection is not None, NOT_FOUND
+        ret = CollectionBO.delete(self.session, coll_id)
+        if ret:
+            return coll_id
+        else:
+            raise HTTPException(status_code=409, detail=DETAIL_COLLECTION_PUBLISHED)
+
+    def _check_permission(
+        self, user_id: UserIDT, project_ids: ProjectIDListT
+    ) -> Optional[ProjectIDListT]:
+        """
+        Quick & dirty access check by catching the exception.
+        """
+        try:
+            PermissionConsistentProjectSet(
+                self.ro_session,
+                project_ids,  # Need the R/W session here, as the projects MRU is written to. TODO
+            ).can_be_administered_by(user_id, update_preference=False)
+        except AssertionError:
+            return None
+        return project_ids
+
+    def aggregated_from_projects(
+        self,
+        current_user_id: UserIDT,
+        project_ids: ProjectIDListT,
+    ) -> CollectionAggregatedRsp:
+        """
+        aggregated fields from the collection project become properties
+        """
+        projectset = CollectionProjectBOSet(
+            session=self.ro_session, prj_ids=project_ids
+        )
+        excluded: Dict[str, ProjectIDListT] = {}
+        can_be_administered = False
+        try:
+            PermissionConsistentProjectSet(
+                self.ro_session,
+                project_ids,
+            ).can_be_administered_by(current_user_id, update_preference=False)
+            can_be_administered = True
+        except AssertionError:
+            pass
+        initclassiflist = projectset.get_initclassiflist_from_projects()
+        classiffieldlist = projectset.get_classiffieldlist_from_projects()
+        creator_users = projectset.get_annotators_from_histo(self.ro_session)
+        privileges = projectset.get_privileges_from_projects()
+        datas: Dict[str, Any] = {}
+        datas["access"] = projectset.get_access_from_projects()
+        excluded["access"] = datas["access"][1]
+        datas["access"] = datas["access"][0]
+        datas["status"] = projectset.get_status_from_projects()
+        excluded["status"] = datas["status"][1]
+        datas["status"] = datas["status"][0]
+        for column in ["cnn_network_id", "instrument"]:
+            datas[column] = projectset.get_common_attr_from_projects(column)
+            excluded[column] = datas[column][1]
+            datas[column] = datas[column][0]
+        freecols = projectset.get_mapping_from_projects()
+        datas["freecols"] = {}
+        for key, cols in freecols.items():
+            datas["freecols"][key] = dict(freecols[key])
+        aggregated: CollectionAggregatedRsp = CollectionAggregatedRsp(
+            can_be_administered=can_be_administered,
+            initclassiflist=initclassiflist,
+            classiffieldlist=classiffieldlist,
+            creator_users=creator_users,
+            privileges=privileges,
+            access=datas["access"],
+            cnn_network_id=datas["cnn_network_id"] or "",
+            instrument=datas["instrument"] or "",
+            status=datas["status"] or "",
+            freecols=datas["freecols"],
+            excluded=excluded,
+        )
+        return aggregated
+
+    @staticmethod
+    def _exclusive_creator_associate(req):
+        if "creator_users" not in req or "associate_users" not in req:
+            return
+        if len(req["creator_users"]) > 0 and len(req["associate_users"]) > 0:
+            commonusers = [
+                usr for usr in req["creator_users"] if usr in req["associate_users"]
+            ] + [usr for usr in req["associate_users"] if usr in req["creator_users"]]
+            if len(commonusers) > 0:
+                raise HTTPException(
+                    HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=[DETAIL_EXCLUSIVE_CREATOR_ASSOCIATE],
+                )
+        return

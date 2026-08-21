@@ -1,0 +1,10 @@
+{% extends "./v2/help/_layout.html"%}
+{% block article %}
+<article id="table-of-contents" class="table-of-contents">
+  <h2 class="help-title">{{ _('Help Summary')}} </h2>
+{{ listhelp(helps) }}
+{%-if current_user.is_app_admin-%}
+<div data-action="astext" data-target="table-of-contents" data-title="{{_('Download help as doc')}}" class="w-full cursor-pointer mr-12 my-8"><i class="icon icon-document-text"></i> {{_('print full help')}}</div>
+{%-endif-%}
+</article>
+{% endblock%}

@@ -1,0 +1,47 @@
+{% if not partial%}
+{% extends "./v2/layout.html" %}
+{% from './v2/macros/macros.html' import modal %}
+{% endif %}
+{% block body %}
+<div class="container block mx-auto" data-script="browse-taxonomy">
+    <div class="text-medium info">
+        {{_('This page allows you to browse the taxa tree, using below search box.')}}<br>
+{% if create_ok %}
+       {{_('You can as well create a new taxon.')}}<br>
+{% endif %}
+    </div>
+    <div class="flex flex-row w-full my-4">
+{% if create_ok %}
+        <div data-request="href" data-href="{{url_for('gui_taxo_sync')}}"  class="button btn-primary mr-2"><i class="icon icon-refresh-sm"></i> {{_('Synchronize with EcotaxoServer')}}
+        </div>
+        <div data-request="href" data-href="{{url_for('gui_add_taxon')}}" data-modal="modal-taxon" class="button btn-primary mr-2"><i class="icon icon-plus-sm"></i>{{ _('Create taxon')}} </div>
+{% endif %}
+        <a href="{{taxoserver_url()}}/browsetaxo/" class="button btn-primary mr-2"><i class="icon icon-link-sm "></i>
+            {{_('Browse taxonomy on EcoTaxoServer')}}</a>
+          <a href={{fromurl}} class='button btn-default'>{{fromtext}}</a>
+    </div>
+    <details class="modal-container no-marker modal-popup"  id="modal-taxon"><summary class="hide">X</summary>
+        <div class="modal"><div class="modal-body"><div class="modal-title"></div><div class="modal-content"></div><div class="modal-footer"></div></div></div></details>
+    <div>
+        <label for="search">Search:  <input name="search" id="search" type="text" class="form-input text-sm w-96"></label></div>
+        <div>
+            <table id="tbl" class="table-table">
+                <thead>
+                <tr>
+                    <th>{{_('ID')}}</th>
+                    <th>{{_('AphiaID')}}</th>
+                    <th>{{_('Name')}}</th>
+                    <th>{{_('Type')}}</th>
+                    <th>{{_('Lineage')}}</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr>
+                    <td colspan="4">{{_('Search results appear here.')}}</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+{% endblock %}

@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+#
+# DB utils around PG.
+#
+from datetime import datetime
+from enum import Enum
+from typing import List, Tuple, Any, Callable, Optional
+
+# noinspection PyUnresolvedReferences
+from sqlalchemy import VARCHAR, INTEGER, CHAR, event  # fmt: skip
+# noinspection PyUnresolvedReferences
+from sqlalchemy.dialects.postgresql import (
+    DOUBLE_PRECISION,
+    REAL,
+    DATE,
+    TIMESTAMP,
+    BIGINT,
+    SMALLINT,
+    BYTEA,
+    JSONB,
+)  # fmt: skip
+# noinspection PyUnresolvedReferences
+from sqlalchemy.dialects.postgresql import dialect as pg_dialect  # fmt: skip
+# noinspection PyUnresolvedReferences
+from sqlalchemy.dialects.postgresql import insert as pg_insert, Insert as PgInsert  # fmt: skip
+# noinspection PyUnresolvedReferences
+from sqlalchemy.sql import any_ as _pg_any, all_ as _pg_all  # fmt: skip
+
+from .ORM import text, Session, column, Integer
+
+
+def populate(store1, sess, seq_name, size):
+    store = store1
+    res = sess.execute(
+        "select nextval('%s') FROM generate_series(1,%d)" % (seq_name, size)
+    )
+    for a_num in res:
+        store.append(a_num[0])
+
+
+class SequenceCache(object):
+    """
+    Generate and keep in memory some valid sequence numbers.
+    """
+
+    def __init__(self, session: Session, seq_name: str, size: int):
+        self.sess = session
+        self.seq_name = seq_name
+        self.size = size
+        self.store: List[int] = []
+        # Do not consume sequence during __init__, so if the cache is not used, no useless seq consumption
+        # populate(self.store, self.sess, self.seq_name, self.size)
+
+    def next(self):
+        try:
+            return self.store.pop(0)
+        except IndexError:
+            populate(self.store, self.sess, self.seq_name, self.size)
+            return self.next()
+
+
+class LocalSequenceCache(object):
+    """
+    Generate and keep in memory some valid sequence numbers, from a project-local generator.
+    """
+
+    def __init__(self, session: Session, generator_def: Callable[[], int]):
+        self.sess = session
+        self.generator_def = generator_def
+        self.next_id: Optional[int] = None
+
+        # Hook: Invalidate the cache when the session commits or rolls back,
+        # because the advisory lock (used in generator_def) is released.
+        @event.listens_for(self.sess, "after_commit")
+        def receive_after_commit(_session):
+            self.clear()
+
+        @event.listens_for(self.sess, "after_rollback")
+        def receive_after_rollback(_session):
+            self.clear()
+
+    def clear(self):
+        """Empty the local store of IDs."""
+        self.next_id = None
+
+    def next(self):
+        if self.next_id is None:
+            self.next_id = self.generator_def()
+        ret = self.next_id
+        self.next_id += 1
+        return ret
+
+
+def db_server_now(session: Session) -> datetime:
+    """
+    Return the current time on DB server.
+    """
+    return session.scalar(text("select now()"))
+
+
+class DateFormat(int, Enum):
+    ISO_8601_2004_E = 1  # ISO 8601:2004(E)
+
+
+def timestamp_to_str(ts: datetime, fmt: int = DateFormat.ISO_8601_2004_E) -> str:
+    """
+    Convert a postgres timestamp to a string.
+    As per DBAPI, it's mapped to a DateTime.
+    """
+    assert fmt == DateFormat.ISO_8601_2004_E
+    # e.g. 2009-02-20T08:40Z as we have UTC dates
+    ret = ts.isoformat()
+    if len(ret) > 10:
+        return ret + "Z"
+    else:
+        return ret
+
+
+def values_cte(name: str, cols: Tuple[str, str], values: List[Tuple[int, int]]):
+    """
+        Return a SQLAlchemy values CTE from given data.
+        Example CTE:
+            with upd_smp (src_id, dst_id) as (values (5,6), (7,8)),
+    :param cols: The column names in the CTE.
+    :param values: The constant values.
+    """
+    # Below generate a union all which is ugly
+    # sa=sqlalchemy
+    # first_values = sa.select([sa.cast(sa.literal(values[0][0]), sa.Integer).label(cols[0]),
+    #                           sa.cast(sa.literal(values[0][1]), sa.Integer).label(cols[1])])
+    # stmts = [first_values]
+    # stmts.extend([sa.select([sa.literal(a_val[0]), sa.literal(a_val[1])]) for a_val in values[1:]])
+    # cte = sa.union_all(*stmts).cte(name=name)
+    # return cte
+
+    cte_txt = "values " + ", ".join(["(%d,%d)" % a_val_pair for a_val_pair in values])
+    # Giving names to columns is OK in the text but does not propagate to the WITH statement:
+    #    vals_text = sa.text(cte_txt).columns(column(cols[0], Integer), column(cols[1], Integer))
+    # The columns are named "columnX" by PG
+    vals_text = text(cte_txt).columns(
+        column("column1", Integer), column("column2", Integer)
+    )
+    ret = vals_text.cte(name=name)
+    return ret
+
+
+def find_in_cursor(columns: Any, name: str) -> int:
+    for idx, a_col in enumerate(columns):
+        if a_col.name == name:
+            return idx
+    return -1

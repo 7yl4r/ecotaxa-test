@@ -1,0 +1,99 @@
+{% macro nav_header(target_proj,headcenter) -%}
+{#write central header - project title or page main action title#}
+{% if target_obj or headcenter !='' %}
+<h3>
+  {{ headcenter }}
+  {% if target_obj and targetid != 0 %}
+  {{target_type}} [{{ targetid }}] {{ target_obj.title }}
+  {% endif %}
+</h3>
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro modal(id,btn = {'class':'','text':'','data':''},modal_title='',modal_content='',type='modal-popup', position='' ,summary_pos={'float':'','clear':''} ,data='') -%}
+<details {{' id=' + type if type=='modal-help' }} class="modal-container  no-marker {{ type }} {{ position }}" {{ 'data-form=' + data.form if 'form' in data }} {{ 'data-file=' + data.file if 'file' in data and type=='modal-help'}} >
+  {% if type=='modal-popup' %}
+  <summary><div class="{{ btn['class'] if btn['class'] else 'button is-action inline-block' }}" data-for="{{ id }}" {{ btn['data'] if btn['data']  }}>
+    {#icon#}
+    {%if btn and 'icon' in btn%}
+    <i class=" icon {{ btn['icon']|safe }}"></i>
+    {% endif%}
+    <span>{{btn['text'] if btn['text'] else '' }}</span></div></summary>
+  <div class="modal" id="{{ id }}" aria-modal="true" role="dialog">
+    <div class="modal-body" for="{{ id }}">
+      <div class="modal-title">
+        <div class="block w-full">
+        <span class="h3">{{modal_title}}</span></div>
+        {% if 'header' in data and  data.header !='' %}
+          {% with args = data %}
+          {% include data.header %}
+          {% endwith%}
+      {% endif%}
+      </div>
+      <div class="modal-content">
+        {% if modal_content != '' %}
+        {% include modal_content  ignore missing %}
+        {% else %}
+        {{ _('Please wait ...')}}
+        {% endif %}
+      </div>
+      <div class="modal-footer">{% if 'footer' in data and data.footer !=''%}
+      {% include data.footer %}
+    {% endif%}</div>
+    </div>
+  </div>
+  {% else %}
+  {% if summary_pos is iterable%}
+  {% set pos =''%}
+  {% for prop,val in summary_pos.items() %}
+  {% set pos = pos + prop + '-' + val + ' ' if val!='' %}
+  {% endfor %}
+  {% endif %}
+  <summary class="aside-label" {{ 'data-request=help' if type=='modal-help' }}  {{ 'data-for=' + data.for if 'for' in data and data.for!='' and type=='modal-help'}}><span class="summary-title"><i class="icon icon-help align-text-bottom leading-snug mr-0.5"></i>{{ modal_title }}</span></summary>
+  <div class="modal" id="{{ id }}" >
+  <div class="aside-body">
+      {% set modal_content='./v2/help/index.html' if (modal_content == '' and type=='modal-help') else modal_content %}
+      {%- include modal_content ignore missing -%}
+      </div>
+  </div>
+  {% endif %}
+  <div class="up" data-action="gotop" data-target="{{ id }}"></div>
+</details>
+{%- endmacro %}
+{% macro inputdict(id,name,value=0, label='', type = '', multiple = False,placeholder='Select', required = False, autocomplete=False,data='',options=None, readonly=False) -%}
+{% if autocomplete == True %}
+<select {{ 'multiple' if multiple }} name="{{ name }}" id="{{ id }}" class="form-select js js-autocomplete" data-placeholder="{{ placeholder }}" data-type="{{ type }}" {{ 'required' if required }} {{ 'readonly' if readonly==True }} {{ data if data }}>
+  {% if options != None and options is iterable%}
+      <option value='' {{ 'selected' if value =='' or value==0 }} {{ 'disabled hidden' if value == 0  }}>{{ placeholder +'...'}}</option>
+  {% for option in options%}
+
+  {% set v= option[0] if option is not string  else option %}
+    {% set l= option[1] if option is not string  else option %}
+    <option value="{{ v }}" {{ 'selected' if v == value or (type=='country' and l==value) }} >{{ l }}</option>
+  {%endfor%}
+  {%else %}
+      <option value="{{value}}" {{ 'selected' if value ==value}} {{ 'disabled hidden' if value == 0  }}>{{ label}}</option>
+  {%endif%}
+
+</select>
+{% else %}
+<div class="form-box">
+  <input type="hidden" name="{{ name }}" id="{{ id }}" data-type="{{ type }}" {{ 'required' if required}}  value="{{ value }}"> <input type="text" class="form-input" value="{{ label }}" {{'readonly' if readonly==True}} ></div>
+{% endif %}
+{%- endmacro %}
+
+{% macro form_group_radio(id,name,value,label,val,required=False,help='',extra='',readonly=False, radio=True) -%}
+{%- set type='radio' if radio==True else 'checkbox'-%}
+<div class="group-radio {{type}}"><input type="{{type}}" class="peer" name="{{ name }}" id="{{ id}}" value="{{ value }}" {{'required' if required==True }}  {{'disabled data-readonly' if readonly==True}} {{ 'checked' if val==value }} {{extra}}>
+  <label for="{{id}}" class="peer-checked:bg-pchecked-400  peer-checked:text-white  peer-checked:shadow" {{help}}>{{ label }}</label></div>
+{%- endmacro %}
+{% macro checkbox_radio(name, id , checkedvalue, value='', label="",type="checkbox",required=False,extra='', readonly=False) -%}
+  <label class="checkbox-label" for="{{id}}"><input type="{{type}}" name="{{ name }}" id="{{ id }}" class="form-checkbox" value="{{ checkedvalue }}"  {{ 'checked' if value==checkedvalue }}  {{'data-readonly' if readonly==True}}  {{ extra|safe }}> {{ label }} </label>
+{%- endmacro %}
+{% macro alerttype(type ="info") -%}
+{% set titles = { 'danger': _('IMPORTANT :'),  'warning': _('WARNING:'),  'info': _('INFORMATION:'),  'success': _('SUCCESS:'),  'error': _('ERROR:'),'maintenance':_('MAINTENANCE')} %}
+{{ titles[type] }}
+{%- endmacro %}
+{%- macro alertbox(type,message,title='', inverse=False, dismissible = False, codeid= True,extra=False,  is_safe = False) -%}
+{%- include './v2/partials/_alertbox.html'-%}
+{%- endmacro -%}

@@ -1,0 +1,147 @@
+{% extends "layout.html" %}
+{% import "js_macros.html" as js %}
+
+{% block body %}
+  <h3>PREDICTION: Choice of Learning Set data source</h3>
+  {{ filters_info|safe }}
+
+  <div class="row">
+    <div class="col-md-4 text-center">
+      <button class='btn btn-primary' onclick='SubmitProjectSelection();'>Next: Choose objects in selected
+        projects
+      </button>
+    </div>
+
+    <div class="panel panel-default col-md-7">
+      <p>A Learning Set AKA <a
+          href="https://en.wikipedia.org/wiki/Training,_validation,_and_test_sets#Training_data_set">Training
+        Data Set</a> is built using validated data from one or several projects.<br>
+        Inside these projects, you will be able, in next pages, to specify: <br>
+        &nbsp;&nbsp;&nbsp;&nbsp;- Which categories you're interested in predicting.<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;- How many objects you want to use as reference for the prediction.<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;- For these objects, which features are relevant to the prediction.<br>
+        This Learning set will then be used for running the prediction task.
+        &nbsp;<span data-container="body" data-toggle="tooltip"
+                    data-placement="right" data-html="true"
+                    title="
+<p style='text-align: left'>You can run the Subset tool to :<ul style='text-align: left'>
+<li>Create a Learning set that you will later improve
+<li>Check validation of a project using a randomly limited number of objects from the project</ul></p>"
+                    class="glyphicon glyphicon-question-sign"></span>
+      </p>
+    </div>
+  </div>
+  <div class="row">
+    <div class="panel panel-default col-md-offset-1 col-md-7" style='display: inline-block; margin-bottom: 8px'>
+      <div class="panel-body" style="padding: 5px;">
+        <form method="post" id="search">
+          <input type="hidden" value="" name="srcs" id="search_srcs">
+          Filter on title :
+          <input style="width: 100px;" name="filt_title" id="filt_title"
+                 value="{{ filt_title }}" type="text">
+          # Matching features &ge;
+          <input style="width: 30px;" name="filt_featurenbr" id="filt_featurenbr"
+                 value="{{ filt_features_nbr }}" type="text">
+          Instrument :
+          <select id="filt_instrum" name="filt_instrum" class="form-control"
+                  style="width: 100px;">
+          </select>
+          <button type="button" onclick='FilterWithProjectSelection();' class="btn btn-primary">Filter
+          </button>
+        </form>
+      </div>
+    </div>
+    <div class="col-md-4">
+      {% if deep_features %}
+        Project deep features model: <span id="prj_deep">{{ deep_features }}</span>.
+      {% else %}
+        <span class="label-warning">No deep features model for the project.</span>
+      {% endif %}
+      <br>Model is <span id="deep_used"></span>
+      <span data-container="body" data-toggle="tooltip"
+            data-placement="right" data-html="true"
+            title="<p>Your project deep features model must exist (see with a Manager if not the case),
+and be the same as in _all_ source projects, to allow deep features extraction and prediction improvement.</p>"
+            class="glyphicon glyphicon-question-sign"></span>
+    </div>
+  </div>
+
+  <div class="center-block" style="margin-left: 1em;max-width:96%">
+    <table class='table table-verycondensed table-hover'>
+      <tr>
+        <th style='width:20px'></th>
+        <th>Inst.</th>
+        <th># - Title</th>
+        <th style='width:100px'># Validated</th>
+        <th style='width:100px'># Matching features</th>
+        <th style='width:100px'>Deep features model</th>
+      </tr>
+      {% for line in prj_table %}
+        <tr>
+          <td><input type='checkbox' {{ "checked" if line.checked }}
+                     onchange="SyncDeepPossible()"
+                     class='selproj' data-prjid='{{ line.projid }}'>
+          </td>
+          <td>{{ line.instrument }}</td>
+          <td>#{{ line.projid }} - {{ line.title }}</td>
+          <td>{{ line.validated_nb }}</td>
+          <td>{{ line.matching_nb }}</td>
+          <td id="deep{{ line.projid }}">{{ line.deep_model }}</td>
+        </tr>
+      {% endfor %}
+      {{ TblBody|safe }}
+    </table>
+  </div>
+
+  <script>
+
+      function SyncDeepPossible() {
+          // Tell the user if using deep features will be possible or not
+          const prj_model = $("#prj_deep").text();
+          const feedback = $("#deep_used");
+          if (prj_model === "") {
+              feedback.text("missing.");
+              return;
+          }
+          var ok = true;
+          const sel_models = $(".selproj:checked").map(function () {
+              const prj_id = $(this).data('prjid');
+              const deep_for_prj = $("#deep" + prj_id).text();
+              if (prj_model !== deep_for_prj) {
+                  ok = false;
+              }
+          });
+          if (ok) {
+              feedback.attr("class", "label-success");
+              feedback.text("usable.");
+          } else {
+              feedback.attr("class", "label-warning");
+              feedback.text("not usable.");
+          }
+      }
+
+      function SubmitProjectSelection() {
+          var srclst = $(".selproj:checked").map(function () {
+              return $(this).data('prjid');
+          }).get().join(',');
+          PostDynForm("?{{ url|safe }}", {src: srclst});
+      }
+
+      function FilterWithProjectSelection() {
+          var srclst = $(".selproj:checked").map(function () {
+              return $(this).data('prjid');
+          }).get().join(',');
+          $('#search_srcs').prop("value", srclst);
+          $('#search').submit();
+      }
+
+      $(function () {
+          $('[data-toggle="tooltip"]').tooltip();
+          SyncDeepPossible();
+          $("#filt_instrum").{{ js.select2_instrument('true') }};
+          const filt_instrum = "{{ filt_instrum }}";
+          {{ js.select2_setval('#filt_instrum', 'filt_instrum', 'filt_instrum') }}
+      })
+
+  </script>
+{% endblock %}

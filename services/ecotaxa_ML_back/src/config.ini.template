@@ -1,0 +1,22 @@
+[default]
+
+[conf]
+# DB connectivity, the user must be able to read/write every PG object there
+DB_USER = postgres
+DB_PASSWORD = xxxxxxxx
+DB_HOST = localhost
+DB_PORT = 5435
+DB_DATABASE = ecotaxa4
+# Optional: Read-only user, to same or other DB, the user must be able to read tables there
+RO_DB_USER = readerole
+RO_DB_PASSWORD = xxxxxxxx
+RO_DB_HOST = localhost
+RO_DB_PORT = 5435
+RO_DB_DATABASE = ecotaxa4
+
+# Where all images are stored. ro by the backend.
+VAULT_DIR = /eco_data/vault
+# One subdirectory here per job. r/w by the backend.
+JOBS_DIR = /eco_data/temptask
+# CNN models. ro by the back-end.
+MODELSAREA = /home/ecotaxa/models

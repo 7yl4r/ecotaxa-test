@@ -1,0 +1,14 @@
+.openapi-generator-ignore
+.openapi-generator
+.run
+.mypy_cache
+.idea/*
+*.zip
+__pycache__/
+*.py[cod]
+/venv*/
+/dev_gui/src/html/
+/dev_gui/node_modules/
+/testsandbox/*
+/dev_gui/package-lock.json
+/py

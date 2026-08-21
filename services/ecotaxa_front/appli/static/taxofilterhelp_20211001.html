@@ -1,0 +1,27 @@
+<style>
+  #PopupDetails .modal-dialog {width: 1100px;}
+  #PopupDetails .modal-content {width: 1100px;}
+</style>
+<div style='margin:10px;font-size: large;'>
+<span style="font-weight: bold;">Taxonomy filter Help.</span>
+  <hr>
+<u>Definitions</u>
+<ul>
+<li><b>lineage</b>: succession of taxonomic categories connected by a continuous line of descent from ancestor to descendant.
+<br>For phylogenetic categories, a lineage is a subset of the evolutionary tree of life.
+<br>In EcoTaxa, lineages are represented from descendant to ancestor, separated by "<"; e.g. "Opisthokonta&lt;Eukaryota&lt;living". Right-clicking on a category in the taxonomy filter (below) shows its full lineage.
+</li><li><b>scientific name</b> : name of one element of the lineage.
+</li><li><b>unique name</b> : name of a category as displayed in EcoTaxa. Most often, this is the scientific name of the taxon. When this name is ambiguous, the name of ancestors are added to make it unique (e.g. "head" becomes "head&lt;Appendicularia" or "head&lt;Chaetognatha")
+</li></ul>
+  <u>Simple search</u>
+<br>Names are autocompleted based on the unique name after the first three characters are typed. Search is not sensitive to case. Space (and *) are considered as wildcards. A wildcard is always added at the end of the query.
+<br>Examples :
+<br><code>cop</code> returns "<b>Cop</b>epoda", "<b>Cop</b>elatus", ...
+<br><code>co˽ae</code> (where ˽ is a space) returns "<b>Co</b>rycaeid<b>ae</b>", "<b>Co</b>ccolithace<b>ae</b>", but also "<b>Co</b>chlodesma pr<b>ae</b>tenue", ...
+<br><code>he˽ap</code> returns "<b>he</b>ad&lt;<b>Ap</b>pendicularia" (matching the unique name), as well as "<b>He</b>leococcum j<b>ap</b>onese", ...
+<br><code>˽virid</code> returns "Acanthocyclops <b>virid</b>is", "Acarospora fulvo<b>virid</b>ula", ...
+<br>
+<br><button type="button" class="btn btn-default " onclick="$('#PopupDetails').modal('hide');">Close</button>
+<br>
+</div>
+

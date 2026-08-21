@@ -1,0 +1,546 @@
+'use strict';
+import tomSelectcss from "../css/tom-select.css";
+import DOMPurify from 'dompurify';
+import TomSelect from 'tom-select/dist/js/tom-select.base.min.js';
+import TomSelect_remove_button from 'tom-select/dist/js/plugins/remove_button.js';
+import TomSelect_clear_button from 'tom-select/dist/js/plugins/clear_button.js';
+import TomSelect_caret_position from 'tom-select/dist/js/plugins/caret_position.js';
+import TomSelect_drag_drop from 'tom-select/dist/js/plugins/drag_drop.js';
+TomSelect.define('remove_button', TomSelect_remove_button);
+TomSelect.define('clear_button', TomSelect_clear_button);
+TomSelect.define('caret_position', TomSelect_caret_position);
+TomSelect.define('drag_drop', TomSelect_drag_drop);
+import {
+  fetchSettings, create_box
+} from '../modules/utils.js';
+import {
+  models,
+  domselectors,
+  css,
+} from '../modules/modules-config.js';
+import {
+  AlertBox
+} from '../modules/alert-box.js';
+import {
+  FormSubmit
+} from '../modules/form-submit.js';
+let users_list = null;
+function _get_label(el, labelfield, item = false) {
+  if (!labelfield) return el.text;
+  let label = [];
+  if (Object.keys(el).indexOf(labelfield) >= 0) label.push(el[labelfield]);
+  else if (labelfield.indexOf('+') > 0) {
+    if (item === true) label.push(el[labelfield.split('+')[0]]);
+    else labelfield.split('+').forEach(l => {
+      if (l in el) label.push(el[l]);
+    });
+  }
+  return label.join(` `);
+}
+
+function createJsTomSelect() {
+  const funcselector='.js-autocomplete';
+  function applyTo(item, settings = {}, siblings = null) {
+    const id = item.getAttribute('id');
+    const multiple = item.hasAttribute('multiple');
+    const type = item.dataset.type;
+    const orderitems=(item.dataset.hasOwnProperty('orderitems'))?true:false;
+    let _fetching={};
+    let option = {
+        url: '',
+        settings: settings
+      },
+      init_canceltag = (tag) => {
+        tag.addEventListener('click', (e) => {
+          const v = e.currentTarget.closest(domselectors.component.tomselect.item).dataset.value;
+          if (v) {
+            e.stopImmediatePropagation();
+            item.tomselect.removeItem(v);
+          }
+        })
+      }
+    if (item.dataset.hasOwnProperty('create') && item.dataset.create === 'true') {
+      option.settings.create = true;
+      option.settings.addPrecedence = true;
+    }
+    if (item.dataset.hasOwnProperty('empty') && item.dataset.empty === 'true') {
+      option.settings.allowEmptyOption = true;
+    }
+    option.settings.maxItems =(item.dataset.hasOwnProperty('maxitems'))? parseInt(item.dataset.maxitems):(multiple) ? null : 1;
+    switch (type) {
+      case models.project:
+      case models.renamingrules:
+        // for top navigation search and collections
+        option.url = "/gui/prjlist/";
+        option.settings = { ...option.settings,
+          ...{
+            valueField: 'id',
+            searchField: 'text',
+            labelField: 'text',
+            openOnFocus: false,
+            maxItems: option.settings.maxItems,
+            allowEmptyOption: false,
+          }
+        };
+        break;
+      case models.organisation:
+        option.url = "/api/organizations/search?name=";
+        option.settings = { ...option.settings,
+          ...{
+            valueField: 'id',
+            searchField: 'text',
+            labelField: 'text',
+            openOnFocus: false,
+            allowEmptyOption: false,
+          }
+        };
+        break;
+      case models.person:
+        option.url = "/gui/search_persons?name=";
+        const personurl="/gui/persons/create/";
+        if (item.dataset.prefix) option.settings.itemprefix=item.dataset.prefix;
+        const open_new_person= async function() {
+        if(_fetching[personurl]) return;
+        _fetching[personurl]=true;
+        const response = await fetch(personurl,fetchSettings);
+        _fetching[personurl]=false;
+        return response;
+        }
+        const wait_for_input=async function(resp,newone,callback) {
+               let response;
+            const reply=(resp.ok) ?await resp.text():await Promise.reject(resp);
+        const parent=item.form.parentElement;
+        parent.classList.remove("relative");
+        document.body.classList.add(css.hidevscroll);
+        const popup =create_box("div", {class:["absolute","z-[100]","bg-white","w-96","h-48","p-8","rounded","drop-shadow","centered"],src:personurl},parent);
+        parent.disabled=true;
+        const close=create_box("div",{class:[domselectors.close.substr(1)],text:"x"},popup);
+        const content=create_box("div",{class:["h-full","w-full"]},popup);
+        close.addEventListener('click', (e)=> {popup.remove();delete parent.disabled;  document.body.classList.remove(css.hidevscroll); });
+        content.insertAdjacentHTML('afterbegin',reply);
+        popup.querySelectorAll('[data-href]').forEach(btn=> {
+        popup.classList.remove('h-48');
+        popup.classList.add('h-auto');
+        popup.classList.add('overflow-y-auto');
+        popup.classList.add('max-h-full');
+        btn.addEventListener('click',async(e)=>{
+        const url=btn.dataset.href + '?type=' + btn.dataset.type;
+        if(_fetching[url]) return;
+        _fetching[url]=true;
+        response =await fetch(url,fetchSettings);
+        _fetching[url]=false;
+        const reply=(response.ok) ?await response.text():await Promise.reject(response);
+        content.innerHTML=reply;
+        content.querySelectorAll(funcselector).forEach(el=> {applyTo(el);});
+        const form2submit=popup.querySelector('form');
+        form2submit.dataset.fetch=true;
+        const formSubmit = new FormSubmit(form2submit);
+        let namefield=popup.querySelector("[id='name']");
+        if (namefield !==null) namefield.value=newone;
+        else {
+            namefield=popup.querySelector("[id='lastname']");
+            if (namefield !==null) namefield.value=newone;
+        }
+        content.querySelector("[type='submit']").addEventListener('click', async(e) => {
+        e.preventDefault();
+        response=await formSubmit.submitForm();
+        if (response.success) {
+        newone=response[btn.dataset.type];
+        const newitem={id:newone.id, "name":newone.name};
+        if (btn.dataset.type=="guest") newitem["name+email"]= newone.name+" "+newone.email;
+        else if(option.settings.itemprefix) newitem.id=option.settings.itemprefix+newitem.id;
+         if(callback) callback(newitem);
+        popup.remove();
+        document.body.classList.remove(css.hidevscroll);
+        } else popup.insertAdjacentHTML('afterbegin',response.message);
+
+         })
+        })})
+        }
+        option.settings = { ...option.settings,
+          ...{
+            valueField: 'id',
+            searchField: 'name',
+            labelField: 'name+email',
+            onItemRemove: function(e) {
+              if (multiple || !this.revertSettings || (this.revertSettings.innerHTML === '' && this.revertSettings.tabIndex === 0) || this.revertSettings.tabIndex < 0) return;
+              const revert = item.options[this.revertSettings.tabIndex].value;
+            }},
+              onItemAdd: function(e) {
+              }}
+        if (item.dataset.create ) {
+            option.settings.create=function(e,callback) {
+              open_new_person(e).then(response => { wait_for_input(response,e,callback);
+              });
+            }
+           }
+        break;
+      case models.user:
+        option.url = "/api/users/search?by_name=";
+        option.settings = { ...option.settings,
+          ...{
+            valueField: 'id',
+            searchField: 'name',
+            labelField: 'name+email',
+            onInitialize: function() {
+              if (item.currentlist) users_list = item.currentlist;
+              else if(item.name.indexOf('[')>=0) { users_list = {}; item.tomselect.items.forEach(e => {
+                if (e !== '' && parseInt(e) > 0) users_list[e] = true;
+              });}
+            },
+            onItemAdd: function(e) {
+              if (e === "") return;
+              if (users_list!==null  && users_list[e] ) {
+                //  if (multiple || !this.revertSettings || this.revertSettings.tabIndex < 0 || !item.options.length) return;
+                AlertBox.addMessage({
+                  type: AlertBox.alertconfig.types.danger,
+                  parent: item,
+                  content: AlertBox.i18nmessages.exists
+                });
+                setTimeout(() => {
+                  this.removeOption(e);
+                  if (this.revertSettings.tabIndex < 0 || !item.options.length || !this.revertSettings) {
+                    this.removeItem(e);
+                    users_list[e] = true;
+                  } else {
+                    const revert = item.options[this.revertSettings.tabIndex].value;
+                    this.addItem(revert);
+
+                  }
+                 /* AlertBox.addMessage({
+                    type: AlertBox.alertconfig.types.danger,
+                    parent: item,
+                    content: AlertBox.i18nmessages.exists
+                  });*/
+                }, 2000);
+              } else if (users_list!==null) users_list[e] = true;
+            },
+            onItemRemove: function(e) {
+              if (users_list!==null && users_list[e]) delete users_list[e];
+              if (multiple || !this.revertSettings || (this.revertSettings.innerHTML === '' && this.revertSettings.tabIndex === 0) || this.revertSettings.tabIndex < 0) return;
+              const revert = item.options[this.revertSettings.tabIndex].value;
+              if (users_list!==null && users_list[revert] !== undefined) delete users_list[revert];
+              if (this.options.url!=="") this.removeOption(e);
+            }
+          }
+        };
+        break;
+      case models.instr:
+        option.url = "/search/instruments";
+        option.settings = {
+          valueField: 'id',
+          labelField: 'text',
+          searchField: 'id',
+          maxItems: 1,
+          preload: true
+        };
+        break;
+      case models.taxo:
+        option.url = "/search/taxo";
+        TomSelect.define('no_close', () => {
+          this.close = () => {};
+        });
+
+        option.settings = { ...option.settings,
+          ...{
+            valueField: 'id',
+            labelField: 'text',
+            searchField: 'text',
+            status: 'status',
+            closeAfterSelect: true,
+            persist: false,
+            onInitialize: () => {
+              const wrapper = document.getElementById(id).nextElementSibling;
+              if (!wrapper.classList.contains('ts-wrapper')) return;
+              const tags = wrapper.querySelectorAll(domselectors.component.tomselect.tsdelet);
+              tags.forEach(tag => {
+                init_canceltag(tag);
+              })
+
+            },
+          }
+        }
+        if (item.dataset.hasOwnProperty("worms") || item.dataset.hasOwnProperty("taxonomy"))  option.settings = { ...option.settings,
+          ...{labelField: 'display_name',
+            searchField: 'display_name'}} //,lineage:"lineage",id_lineage:"id_lineage"
+        break;
+    }
+    const default_settings = {
+      create: false,
+      minOptions: 0,
+      maxOptions: null,
+      preload: false,
+      hideSelected: true,
+      duplicates: false,
+      allowEmptyOption: true,
+      closeAfterSelect: true,
+      placeholder: (item.placeholder) ? item.placeholder : ((item.dataset.placeholder) ? item.dataset.placeholder : ''),
+      onDropdownClose: function() {
+
+      },
+      shouldLoad: function(query) {
+        return query.length > 2
+      },
+      onItemRemove: function() {
+        return true;
+      },
+      load: function(query, callback) {
+        query = DOMPurify.sanitize(query);
+        const self = this;
+        if (self.loading > 10) {
+          callback();
+          return;
+        }
+        let url = option.url;
+        switch (type) {
+          case models.user:
+          case models.organisation:
+          case models.person:
+            url += encodeURIComponent('%' + query + '%');
+          break;
+          case models.taxo:
+          case models.instr:
+            //
+            if (query) url += '?q=' + encodeURIComponent(query);
+            if (type==models.taxo) {
+                if (item.dataset.hasOwnProperty('worms') ) url+='&worms=true';
+                else  if (!item.dataset.hasOwnProperty('nodeprecated')) url+='&withdeprecated=true';
+            }
+            break;
+          case models.project:
+          case models.renamingrules:
+            if (query) url += '?filt_title=' + encodeURIComponent(query); //+ '&filt_instrum=' + encodeURIComponent(query);
+            break;
+        }
+        if (url !== null) {
+          if(_fetching[url]) return;
+          _fetching[url]=true;
+          fetch(url, fetchSettings()).then(response => response.json()).then(json => {
+            if (type === models.project || type === models.renamingrules) {
+              if (json.data && json.data.length) json = json.data.map(row => {
+                return {
+                  id: row[1],
+                  text: row[3][0],
+                  rights: row[0]
+                }
+
+              });
+            } else if ([models.instr, models.organisation].indexOf(type) >= 0 && json.length) json = json.reduce((result, a, v) => {
+              a = DOMPurify.sanitize(a);
+              let obj = {
+                id: a,
+                text: a
+              }
+              result.push(obj);
+              return result;
+            }, []);
+            if (json.length && typeof json == 'object') json = Object.entries(json);
+            return this.options + (callback)?callback(json):json;
+          }).catch((err) => {
+      AlertBox.addAlert({
+        type: AlertBox.alertconfig.types.danger,
+        content: err.status ? `${err.status} ${err.statusText}` : err,
+        dismissible: true,
+      });
+    }).finally(()=> {
+      _fetching[url]=false;});
+        }
+      },
+      render: {
+        option: function(el, escape) {
+          if (el === undefined || el === null) return ``;
+          if (el.$option && el.$option.classList && el.$option.classList.contains(css.deprecated)) el.status='D';
+          // add optgroup
+          const optgroup = (el.hasOwnProperty('optgroup')) ? `data-optgroup=${el.optgroup}` : ``;
+          const label = _get_label(el, option.settings.labelField);
+          const itemprefix =(this.settings.itemprefix  && el[this.settings.valueField].length>this.settings.itemprefix.length)?((el[this.settings.valueField].substr(0,this.settings.itemprefix.length)===this.settings.itemprefix)?this.settings.itemprefix.replace('_',''):""):"";
+          return `<div class="py-2 flex  ${ ((multiple)?'inline-flex':'') } ${itemprefix}  ${((el.status && el.status=='D')?'deprecated':'')} " ${optgroup}  data-value="${el[option.settings.valueField]}">${ escape(label) }</div>`;
+        },
+        item: function(el, escape) {
+          if (el === undefined || el === null) return ``; // add optgroup
+          const optgroup = (el.optgroup) ? `item-${el.optgroup}` : ``;
+          const inlist = (users_list!==null && users_list[el[this.settings.valueField]]) ? `data-inlist` : ``;
+          const cancel = ``;
+          const label = _get_label(el, option.settings.labelField, true);
+          const itemprefix =(this.settings.itemprefix && el[this.settings.valueField].length>this.settings.itemprefix.length)?((el[this.settings.valueField].substr(0,this.settings.itemprefix.length)===this.settings.itemprefix)?this.settings.itemprefix.replace('_',''):""):"";
+          return DOMPurify.sanitize(`<div class="${((multiple) ? `flex inline-flex ` : ``) } ${itemprefix} ${optgroup} ${((el.status && el.status=='D')?'deprecated':'')}" data-value="${el[this.settings.valueField]}" ${inlist}>${ escape(label) } ${ cancel }</div>`);
+        },
+        no_results: function(data, escape) {
+          return DOMPurify.sanitize('<div class="no-results">' + ((item.dataset.noresults) ? item.dataset.noresults : 'No result found for ') + escape(data.input) + '</div>');
+        },
+
+      }
+    }
+    if (item.getAttribute('readonly') === null ) {
+      option.settings.plugins = {
+        'clear_button': {
+          title: (item.dataset.clear) ? item.dataset.clear : 'Clear all',
+          html: (data) => {
+            return `<div class="${data.className}" id="clear-${id}" title="${data.title}"><i class="icon ${(multiple)?``:'p-[0.125rem]'} icon-x-circle-sm ${(multiple)?``:` opacity-50`}"></i></div>`;
+          }
+        }
+      }
+      option.settings.onClear = function() {
+          item.tomselect.clear();
+          return true;
+            };
+      if (multiple) {
+        option.settings.plugins = { ...option.settings.plugins,
+          ...{
+            'remove_button': {}
+          }
+
+        };
+        option.settings.plugins = { ...option.settings.plugins,
+          ...{
+            'caret_position': {}
+          }
+
+        };
+      }
+    }
+    if (orderitems) option.settings.plugins = { ...option.settings.plugins,
+          ...{
+            'drag_drop': {}
+          }
+        };
+    option.settings = Object.assign(default_settings, option.settings);
+    if (item.dataset.noremote) option.settings.load=null;
+    if (id !== null ) {
+      const ts = new TomSelect('#' + id, option.settings);
+      ts.wrapper.classList.remove(domselectors.component.tomselect.ident);
+      ts.wrapper.classList.remove('js');
+      // add
+      ts.wrapper.setAttribute('data-component', 'tom-select');
+      if (item.getAttribute('readonly') !== null) {
+        ts.disable();
+      }
+      switch (type) {
+        case models.taxo:
+          const discarded=[]
+          ts.on('item_add', (v, el) => {
+            if (el !== null) {
+                el.classList.add('new');
+                const opt=ts.getOption(v);
+                if (opt!==null && opt.status && opt.status=='D') el.classList.add(css.deprecated);
+               }
+          });
+          ts.on("load", (v,el) => {
+          v.forEach((taxon)=> {
+            if (taxon[1].status==="D") {
+            if (item.dataset.hasOwnProperty('nodeprecated') )  ts.removeOption(taxon[1].id);
+            if (taxon[1].$id ) {
+                const opt=ts.wrapper.querySelector('#'+taxon[1].$id);
+                if (opt!==null) opt.classList.add(css.deprecated);
+          }}
+          })
+          })
+          if(item.dataset.hasOwnProperty("discard")) {
+            const discard=item.dataset.discard;
+            const discard_target=(item.dataset.hasOwnProperty("discard_target"))?item.dataset.discard_target:null;
+            ts.on('change',  function() {
+                const line=ts.wrapper.closest(domselectors.component.tomselect.line);
+                if (line!==null)  {
+                    let notused =0;
+                    const sellines = line.querySelectorAll('[data-discard]');
+                    sellines.forEach(l => { if (l.value==discard) {notused+=1; if (discard_target!==null) {document.getElementById(discard_target).tomselect.addItem("");}}});
+                    if (notused==sellines.length) line.classList.add(css.notused);
+                    else line.classList.remove(css.notused);
+                }});
+                }
+          if(item.dataset.hasOwnProperty("selattr")) {
+            const selattr=item.dataset.selattr;
+            const idselattr=(item.dataset["id_"+selattr])?item.dataset["id_"+selattr].split(','):item.dataset[selattr].split(',');
+            const nodelineage = document.createElement('ul');
+            nodelineage.classList.add('lineage-list');
+            nodelineage.classList.add(css.hide);
+            ts.wrapper.appendChild(nodelineage);
+            item.dataset[selattr].split(',').forEach((attr,i) => {
+                    const nodeattr=document.createElement('li');
+                    nodeattr.dataset.id=idselattr[i];
+                    const nodeid=nodeattr.dataset.id;
+                    nodeattr.textContent=attr;
+                    nodelineage.appendChild(nodeattr);
+                    nodeattr.addEventListener('click', (e)=> {
+                    if (ts.getOption(nodeid)===null) ts.addOption({display_name:attr, id:nodeid});
+                        nodelineage.classList.add(css.hide);
+                        ts.addItem(nodeid);
+                    })
+                });
+            ts.on("focus", () => { nodelineage.classList.remove('hide');});
+            ['type','blur'].forEach((evt) =>  {ts.on(evt, () => { nodelineage.classList.add(css.hide);})} );
+            }
+
+
+          //  ts.on('clear', () =>{ console.log('clear', ts.items);} )
+          break;
+        case models.project:
+          // add data-noaction just to select a project
+
+          if (item.dataset.dest) {
+            ts.on('item_add', (v, el) => {
+              if (v != item.dataset.value && ts.options[v] && !el.querySelector('a')) {
+                const links = {
+                  "A": "/prj/",
+                  "V": "/prj/",
+                  "M": "/gui/prj/edit/"
+                };
+                const rights = ts.options[v].rights;
+                const keys = Object.keys(rights);
+                if (keys) {
+                  if (keys.length > 1) {
+                    Object.entries(rights).forEach(([k, r]) => {
+                      el.insertAdjacentHTML('beforeend', ` <a data-k="${k}" class="small-caps font-normal ml-2">${r}</a>`);
+                    });
+                    el.querySelectorAll('a').forEach(lk => {
+                      lk.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        window.open(links[e.target.dataset.k] + v, `_proj${v}`).focus();
+                        ts.removeItem(v);
+                      });
+                    })
+                  } else {
+                    window.open(links[keys[0]] + v, `_proj${v}`).focus();
+                    ts.removeItem(v);
+                  }
+                }
+              }
+            });} else if (item.dataset.refresh ) {
+                 const refresh = function(e) {
+        const el=document.getElementById(item.dataset.refresh);
+        if (el===null) return;
+        const href=el.dataset.href.split('?');
+        if (href.length>1) {
+            href[1]=href[1].split("=");
+            if (href[1].length>1) {
+            href[1][1]=item.tomselect.items.join(',');
+            }
+            href[1]=href[1].join('=');}
+            el.dataset.href=href.join('?');
+            el.click();
+        } ;
+        ts.on('item_add', (v,el)=> {
+            if(refresh!==null  && !item.dataset.hasOwnProperty("noaction")) refresh(ts.items.join(','));
+            });
+            ts.on('item_remove', (v,el)=> {
+            if(refresh!==null && !item.dataset.hasOwnProperty("noaction")) refresh(ts.items.join(','));
+            });
+          }
+          break;
+      }
+      return ts;
+    } else console.log('noid');
+  }
+
+  function getUserList() {
+    return users_list;
+  }
+  return {
+    applyTo
+  }
+}
+const JsTomSelect = createJsTomSelect();
+export {
+  JsTomSelect
+}

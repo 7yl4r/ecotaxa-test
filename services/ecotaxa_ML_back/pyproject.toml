@@ -1,0 +1,129 @@
+# To install, in current directory:
+# (venv)$ pip3 install -e ".[dev]" --no-binary=imgaug
+
+# To force full cleanup before install:
+# (venv)$ pip freeze | grep -v "^-e" | xargs pip uninstall -y
+# (venv)$ pip uninstall ecotaxa_ML_back
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecotaxa_ML_back"
+version = "0.1.0"
+description = "EcoTaxa ML Backend"
+readme = "README.md"
+requires-python = "==3.8.*"
+dependencies = [
+    "SQLAlchemy==1.4.31",
+    "psycopg2-binary==2.9.3",
+    # pgvector for similarity search and SQLA/PG column type wrapper
+    "pgvector==0.2.4",
+    # Image processing libs.
+    # Machine learning with no GPU
+    "scikit-learn==1.0",
+    # Machine learning with GPU. NOT automatically regression-tested so to upgrade with caution.
+    "tensorflow==2.6.0",
+    # Workaround https://github.com/tensorflow/tensorflow/issues/51592
+    "keras==2.6.0",
+    "tensorflow-hub==0.12.0",
+    "tensorflow_addons==0.14.0",
+    "protobuf==4.23.2",
+    # Used same place as TF, CNN generation
+    "pandas==1.3.3",
+    ##lycon==0.2.0 # Conflicts with the version required by TF
+    "opencv-python-headless==4.5.3.56",
+    "imgaug==0.4.0",
+    # imgaug needs opencv, but not the headless one, so at docker startup:
+    #   File "/venv/lib/python3.8/site-packages/cv2/__init__.py", line 8, in <module>
+    #     from .cv2 import *
+    # ImportError: libGL.so.1: cannot open shared object file: No such file or directory
+    # https://github.com/aleju/imgaug/issues/737
+    # --no-binary=imgaug -> Unsupported inside toml
+]
+
+[project.optional-dependencies]
+dev = [
+    # tests & coverage
+    "tox<4.0.0",
+    "pytest==8.3.5",
+    "pytest-cov",
+    "pytest-mock==3.14.1",
+    "pytest-asyncio==0.24.0",
+    "coverage==7.6.1",
+    # code quality
+    "mypy==0.921",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+
+[tool.mypy]
+files = ["src"]
+namespace_packages = true
+explicit_package_bases = true
+ignore_missing_imports = true
+# check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "numpy.*",
+    "tensorflow.*",
+    "tensorflow_addons.*",
+    "tensorflow_hub.*",
+    "cv2.*",
+    "imgaug.*",
+    "sklearn.*",
+    "pgvector.*",
+]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src"]
+omit = [".tox/*",
+    "src/DB/*",
+    "src/API_operations/helpers/*",
+    "src/BG_operations/*",
+    "src/ML/models_gen/*"]
+
+[tool.coverage.report]
+omit = [".tox/*"]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+envlist = py38
+skipsdist = True
+
+[testenv]
+deps =
+    .[dev]
+    --no-binary=imgaug
+passenv = POSTGRES_HOST
+            POSTGRES_PORT
+allowlist_externals =
+    coverage
+commands =
+    mypy src
+    coverage erase
+    coverage run -m pytest
+    coverage report
+    coverage html
+    coverage xml -o coverage.xml
+"""

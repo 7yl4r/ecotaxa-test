@@ -1,0 +1,1460 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+# Textual export of data. Presently TSV with images or not, XML.
+#
+import abc
+import csv
+import json
+import os
+import re
+import zipfile
+from pathlib import Path
+from typing import Optional, Tuple, TextIO, Dict, List, Set, Any, Union
+from zipfile import ZipFile
+
+from API_models.exports import (
+    ExportRsp,
+    ExportReq,
+    ExportTypeEnum,
+    SummaryExportGroupingEnum,
+    GeneralExportReq,
+    ExportSplitOptionsEnum,
+    ExportImagesOptionsEnum,
+    SummaryExportReq,
+    BackupExportReq,
+    SummaryExportQuantitiesOptionsEnum,
+    SummaryExportSumOptionsEnum,
+)
+from API_models.filters import ProjectFiltersDict
+from BO.Classification import ClassifIDT
+from BO.Collection import CollectionIDT
+from BO.Mappings import ProjectSetMapping, PREFIX_TO_TABLE
+from BO.ObjectSet import DescribedObjectBOSet
+from BO.ObjectSetQueryPlus import ResultGrouping, IterableRowsT, ObjectSetQueryPlus
+from BO.ProjectVars import REQUIRED_VARS_PER_QUANTITY, QUANTITY_NAMES
+from BO.Rights import RightsBO, Action
+from BO.Taxonomy import TaxonomyBO
+from BO.Vocabulary import Vocabulary, Units
+from DB import Image
+from DB.Object import (
+    VALIDATED_CLASSIF_QUAL,
+    DUBIOUS_CLASSIF_QUAL,
+    PREDICTED_CLASSIF_QUAL,
+)
+from DB.Project import Project, ProjectIDListT, ProjectIDT
+from DB.ProjectVariables import ProjectVariables
+from DB.TaxoRecast import TaxoRecast, RecastOperation
+from DB.helpers.Direct import text
+from DB.helpers.SQL import OrderClause, SelectClause
+from FS.CommonDir import ExportFolder
+from FS.Vault import Vault
+from helpers import (
+    DateTime,
+)  # Need to keep the whole module imported, as the function is mocked
+from helpers.DynamicLogs import get_logger, LogsSwitcher
+from ..helpers.JobService import JobServiceBase, ArgsDict  # fmt:skip
+
+logger = get_logger(__name__)
+
+# Some callers (e.g. the deprecated /export endpoint) may express a sci-summary
+# quantity via SummaryExportQuantitiesOptionsEnum rather than ExportTypeEnum.
+SUMMARY_QUANTITY_TO_EXPORT_TYPE: Dict[
+    SummaryExportQuantitiesOptionsEnum, ExportTypeEnum
+] = {
+    SummaryExportQuantitiesOptionsEnum.abundance: ExportTypeEnum.abundances,
+    SummaryExportQuantitiesOptionsEnum.concentration: ExportTypeEnum.concentrations,
+    SummaryExportQuantitiesOptionsEnum.biovolume: ExportTypeEnum.biovols,
+}
+
+
+class ProjectExport(JobServiceBase):
+    """ """
+
+    JOB_TYPE = "GenExport"
+    ROWS_REPORT_EVERY = 10000
+    IMAGES_REPORT_EVERY = 1000
+
+    # '>'-separated parent categories, e.g. "Copepoda>Oncaeidae". Correlated on txo.id
+    # (not obh.classif_id): txo.id is already part of the GROUP BY (BY_TAXO level) for
+    # the 'count' quantity, which has a real SQL GROUP BY -- obh.classif_id is not, and
+    # Postgres would reject a column reference that's neither grouped nor aggregated.
+    ANNOTATION_CATEGORY_HIERARCHY_SQL = TaxonomyBO.parents_sql("txo.id")
+
+    # Aliases shared by all queries built for the sci-summary export (create_sci_summary),
+    # so key columns line up whichever quantity (abundance/concentration/biovolume) is computed.
+    SCI_SUMMARY_ID_ALIASES: Dict[str, str] = {
+        "sam.orig_id": "sampleid",
+        "acq.orig_id": "acquisid",
+        "txo.display_name": "taxonid",
+        "obh.classif_qual": "status",
+        ANNOTATION_CATEGORY_HIERARCHY_SQL: "annotation_category",
+    }
+
+    def __init__(self, req: ExportReq, filters: ProjectFiltersDict):
+        super().__init__()
+        self.req = req
+        self.filters = filters
+        self.out_file_name: str = ""
+        self.out_path: Path = Path("")
+        self.backup_with_just_image_refs = False
+        self.pre_mapping: Dict[ClassifIDT, Optional[ClassifIDT]] = {}
+        # Set at the beginning of create_sci_summary, tells whether several
+        # projects are exported at once, in which case a 'project_id' column
+        # is added to the output.
+        self._multi_project: bool = False
+        # get pre_mapping
+        if self.JOB_TYPE == "SummaryExport" or self.JOB_TYPE == "GeneralExport":
+            if self.req.collection_id is not None:
+                pre_mapping: Optional[Dict[int, Optional[ClassifIDT]]] = (
+                    self.query_taxo_recast(
+                        target_id=int(self.req.collection_id),
+                        operation=RecastOperation.collection_export,
+                        is_collection=True,
+                    )
+                )
+                if pre_mapping is not None:
+                    self.pre_mapping = pre_mapping
+            else:
+                # project_id can hold several, comma-separated, project ids. Recast is
+                # per-project, so merge the mappings of all the involved projects.
+                for a_project_id in str(self.req.project_id).split(","):
+                    pre_mapping = self.query_taxo_recast(
+                        target_id=int(a_project_id),
+                        operation=RecastOperation.project_export,
+                        is_collection=False,
+                    )
+                    if pre_mapping is not None:
+                        self.pre_mapping.update(pre_mapping)
+
+    def run(self, current_user_id: int) -> ExportRsp:
+        """
+        Initial run, basically just do security check and create the job.
+        """
+        project_ids = str(self.req.project_id).split(",")
+        if self.JOB_TYPE == "BackupExport" or (
+            self.JOB_TYPE == "GeneralExport" and self.req.with_images
+        ):
+            action = Action.ADMINISTRATE
+        else:
+            action = Action.ANNOTATE
+        for project_id in project_ids:
+            _user, _project = RightsBO.user_wants_export(
+                self.session, current_user_id, action, int(project_id)
+            )
+
+        # Security OK, create pending job
+        self.create_job(self.JOB_TYPE, current_user_id)
+        ret = ExportRsp(job_id=self.job_id)
+        return ret
+
+    def init_args(self, args: ArgsDict) -> ArgsDict:
+        args["req"] = self.req.dict()
+        args["filters"] = self.filters
+        return args
+
+    @staticmethod
+    def deser_args(json_args: ArgsDict) -> None:
+        json_args["req"] = ExportReq(**json_args["req"])
+        assert json_args["filters"]
+
+    def do_background(self) -> None:
+        """
+        Background part of the job.
+        """
+        with LogsSwitcher(self):
+            self.do_export()
+
+    # noinspection PyPep8Naming
+    @property
+    def PRODUCED_FILE_NAME(self) -> Optional[str]:
+        result = self.get_job_result()
+        if result is None:
+            return None
+        return result["out_file"]
+
+    def do_export_projects(
+        self, project_ids: ProjectIDListT, progress_before_copy
+    ) -> int:
+        """
+        export project_id
+        """
+        logger.info(
+            "Input Param = %s project_ids = %s" % (self.req.__dict__, project_ids)
+        )
+        req = self.req
+        # Bulk of the job
+        if req.exp_type in (
+            ExportTypeEnum.general_tsv,
+            ExportTypeEnum.backup,
+            ExportTypeEnum.dig_obj_ident,
+        ):
+            nb_rows, nb_images = self.create_tsv(
+                project_ids, 10 if req.with_images else progress_before_copy
+            )
+            if req.with_images:
+                self.add_images(nb_images, 10, progress_before_copy)
+        elif (
+            req.exp_type == ExportTypeEnum.summary and self.JOB_TYPE != "SummaryExport"
+        ):
+            # Deprecated raw /export endpoint: keep producing the historical summary,
+            # for the moment, regardless of any quantity it may carry.
+            nb_rows = self.create_summary(project_ids)
+        elif req.exp_type == ExportTypeEnum.summary or req.exp_type in (
+            ExportTypeEnum.abundances,
+            ExportTypeEnum.concentrations,
+            ExportTypeEnum.biovols,
+        ):
+            if req.exp_type == ExportTypeEnum.summary:
+                if isinstance(req.quantity, SummaryExportQuantitiesOptionsEnum):
+                    raw_exptypes: List[
+                        Union[ExportTypeEnum, SummaryExportQuantitiesOptionsEnum]
+                    ] = [req.quantity]
+                else:
+                    raw_exptypes = req.quantity
+                exptypes: List[ExportTypeEnum] = [
+                    (
+                        SUMMARY_QUANTITY_TO_EXPORT_TYPE[a_type]
+                        if isinstance(a_type, SummaryExportQuantitiesOptionsEnum)
+                        else a_type
+                    )
+                    for a_type in raw_exptypes
+                ]
+            else:
+                exptypes = [req.exp_type]
+            do_exp = 0
+            for _i, exptype in enumerate(exptypes):
+                if exptype in (
+                    ExportTypeEnum.abundances,
+                    ExportTypeEnum.concentrations,
+                    ExportTypeEnum.biovols,
+                ):
+                    do_exp += 1
+            if len(exptypes) > 0 and do_exp == len(exptypes):
+                nb_rows = self.create_sci_summary(project_ids, exptypes)
+            else:
+                raise Exception("Unsupported export type : %s" % req.exp_type)
+        else:
+            raise Exception("Unsupported export type : %s" % req.exp_type)
+        # Zip present log file as well
+        if req.exp_type not in (
+            ExportTypeEnum.summary,
+            ExportTypeEnum.abundances,
+            ExportTypeEnum.concentrations,
+            ExportTypeEnum.biovols,
+        ):
+            logger.info("Log in zip should end here.")
+            self.append_log_to_zip()
+        return nb_rows
+
+    def do_export(self) -> None:
+        """
+        The real job.
+        """
+        self.out_path = self.temp_for_jobs.base_dir_for(self.job_id)
+        req = self.req
+        logger.info("Input Param = %s" % (self.req.__dict__,))
+        # A bit of forward-thinking... Leave 5% of progress bar for final copy
+        progress_before_copy = 100
+        out_file_name = None
+        if req.out_to_ftp:
+            progress_before_copy = 95
+        # Force some implied (in UI) options.
+        if req.only_annotations:
+            req.exp_type = ExportTypeEnum.general_tsv  # No need for a subdir in ZIP
+            req.tsv_entities = ""
+            req.with_images = False  # Thin single TSV
+            req.only_first_image = False
+            req.split_by = ""
+            req.with_internal_ids = False
+            req.coma_as_separator = False
+            req.format_dates_times = False
+            req.with_types_row = True
+        elif req.exp_type == ExportTypeEnum.dig_obj_ident:
+            req.tsv_entities = "OPAS"  # No Comments
+            req.with_internal_ids = False
+            req.split_by = ""
+            req.coma_as_separator = False
+        elif req.exp_type == ExportTypeEnum.backup:
+            req.tsv_entities = "OPAS"  # C is missing, too much work to align tests. In theory, we're supposed to restore identical, even if C cannot in full
+            # req.with_images = True  # We're supposed to restore identical but deprecated data-only backup does not set it
+            self.backup_with_just_image_refs = not req.with_images
+            req.only_first_image = False  # We're supposed to restore identical
+            req.split_by = "sample"
+            req.with_internal_ids = False
+            req.coma_as_separator = False
+            req.format_dates_times = False
+            req.with_types_row = True
+        elif req.exp_type == ExportTypeEnum.general_tsv:
+            if req.split_by == "sample" and "S" not in req.tsv_entities:
+                req.tsv_entities += "S"
+            if req.split_by == "acquisition" and "A" not in req.tsv_entities:
+                req.tsv_entities += "A"
+        done_infos: Dict = {}
+        if req.collection_id:
+            done_infos.update({"collection_id": req.collection_id})
+        project_ids = str(req.project_id).split(",")
+        if req.exp_type == ExportTypeEnum.backup:
+            # loop through projects
+            for project_id in project_ids:
+                nb_rows = self.do_export_projects(
+                    [int(project_id)], progress_before_copy
+                )
+                obj = {"rowcount": nb_rows, "out_file": self.out_file_name}
+                if req.collection_id or len(project_ids) > 1:
+                    obj.update({"project_id": project_id})
+                    done_infos.update({"project": obj})
+                else:
+                    done_infos = obj
+            if req.collection_id:
+                # make a zip containing every export file by project for the collection
+                logger.info("Build collection zip here.")
+                out_file_name = self.build_collection_zip()
+                done_infos.update({"out_file": out_file_name})
+                logger.info("End collection zip here.")
+        else:
+            nb_rows = self.do_export_projects(
+                [int(project_id) for project_id in project_ids], progress_before_copy
+            )
+            done_infos.update({"rowcount": nb_rows, "out_file": self.out_file_name})
+        # Final copy
+        if req.out_to_ftp:
+            export_folder = self.config.export_folder()
+            if export_folder is None:
+                raise Exception(
+                    "out_to_ftp was requested but export folder is not defined"
+                )
+            self.update_progress(progress_before_copy, "Copying file to FTP")
+            dest = ExportFolder(export_folder)
+            # Disambiguate using the job ID
+            if out_file_name is None:
+                out_file_name = self.out_file_name
+            dest_name = "task_%d_%s" % (self.job_id, out_file_name)
+            dest.receive_from(self.out_path / out_file_name, dest_name)
+            logger.info("Result copied to %s", dest_name)
+            final_message = (
+                "Export successful : File '%s' is available (as well)"
+                " in the 'Exported_data' FTP folder" % dest_name
+            )
+        else:
+            final_message = "Export successful"
+
+        self.update_progress(100, final_message)
+        if out_file_name is not None and "out_file" not in done_infos:
+            self.out_file_name = out_file_name
+            done_infos.update({"out_file": self.out_file_name})
+            if self.JOB_TYPE == "SummaryExport" or self.JOB_TYPE == "GeneralExport":
+                # pre_mapping
+                infotaxonomy = {
+                    "taxonomy": {
+                        "renames": self.pre_mapping,
+                    }
+                }
+                done_infos.update(infotaxonomy)
+
+                logger.info(
+                    "------------------ taxonomy renames --------------- %s",
+                    json.dumps(infotaxonomy),
+                )
+        self.set_job_result(errors=[], infos=done_infos)
+
+    def append_log_to_zip(self) -> None:
+        """
+        Copy log file of present job into currently produced zip.
+        """
+        produced_path = self.out_path / self.out_file_name
+        zfile = zipfile.ZipFile(
+            produced_path, "a", allowZip64=True, compression=zipfile.ZIP_DEFLATED
+        )
+        zfile.write(self.log_file_path(), arcname="job_%d.log" % self.job_id)
+        zfile.close()
+
+    def _get_fast_count(self, project_ids: ProjectIDListT) -> int:
+        # Get a fast count of the maximum of what to do
+        count_sql = (
+            "SELECT SUM(nbr) AS cnt FROM projects_taxo_stat WHERE projid IN :prjs"
+        )
+        res = self.ro_session.execute(text(count_sql), {"prjs": tuple(project_ids)})
+        obj_count = res.one()[0]
+        return obj_count
+
+    def create_tsv(
+        self, project_ids: ProjectIDListT, end_progress: int
+    ) -> Tuple[int, int]:
+        """
+        Create the TSV file.
+        """
+        req = self.req
+        user_id = self._get_owner_id()
+        self.update_progress(1, "Start TSV export")
+        progress_range = end_progress - 1
+        # Get a fast count of the maximum of what to do
+        obj_count = self._get_fast_count(project_ids)
+        # Prepare a where clause and parameters from filter
+        src_projects = (
+            self.ro_session.query(Project).where(Project.projid.in_(project_ids)).all()
+        )
+        assert src_projects is not None and len(src_projects) == len(project_ids)
+
+        object_set: DescribedObjectBOSet = DescribedObjectBOSet(
+            self.ro_session, project_ids, user_id, self.filters
+        )
+
+        date_fmt, time_fmt = "YYYYMMDD", "HH24MISS"
+        if req.format_dates_times:
+            # Do not make nice dates for backup
+            date_fmt, time_fmt = "YYYY-MM-DD", "HH24:MI:SS"
+
+        select_clause = SelectClause()
+
+        if req.with_images or self.backup_with_just_image_refs:
+            # Reconstitute the imported file name, rank might have been corrected during import
+            select_clause.add_expr("img.orig_file_name", "img_file_name").add_expr(
+                "img.imgrank", "img_rank"
+            )
+            if not self.backup_with_just_image_refs:
+                select_clause.add_expr("img.imgid", "img_internal_id")
+
+        select_clause.add_expr("obh.orig_id", "object_id")
+        if not req.only_annotations:
+            select_clause.add_expr("obh.latitude", "object_lat").add_expr(
+                "obh.longitude", "object_lon"
+            )
+            select_clause.add_expr(
+                f"TO_CHAR(obh.objdate,'{date_fmt}')", "object_date"
+            ).add_expr(f"TO_CHAR(obh.objtime,'{time_fmt}')", "object_time").add_expr(
+                "obh.object_link"
+            ).add_expr(
+                "obh.depth_min", "object_depth_min"
+            ).add_expr(
+                "obh.depth_max", "object_depth_max"
+            )
+        select_clause.add_expr(
+            f"""CASE obh.classif_qual
+                            WHEN '{VALIDATED_CLASSIF_QUAL}' then 'validated'
+                            WHEN '{PREDICTED_CLASSIF_QUAL}' then 'predicted'
+                            WHEN '{DUBIOUS_CLASSIF_QUAL}' then 'dubious'
+                            ELSE obh.classif_qual
+                         END""",
+            "object_annotation_status",
+        )
+        select_clause.add_expr("usr.name", "object_annotation_person_name").add_expr(
+            "usr.email", "object_annotation_person_email"
+        )
+        select_clause.add_expr(
+            f"""CASE WHEN obh.classif_qual IN ('{VALIDATED_CLASSIF_QUAL}','{DUBIOUS_CLASSIF_QUAL}') THEN TO_CHAR(obh.classif_date,'{date_fmt}') END""",
+            "object_annotation_date",
+        ).add_expr(
+            f"""CASE WHEN obh.classif_qual IN ('{VALIDATED_CLASSIF_QUAL}','{DUBIOUS_CLASSIF_QUAL}') THEN TO_CHAR(obh.classif_date,'{time_fmt}') END""",
+            "object_annotation_time",
+        ).add_expr(
+            "txo.display_name", "object_annotation_category"
+        )
+
+        if (
+            req.exp_type in (ExportTypeEnum.backup, ExportTypeEnum.dig_obj_ident)
+            or req.only_annotations
+        ):
+            select_clause.add_expr("txo.id", "object_annotation_category_id")
+        else:
+            select_clause.add_expr(
+                TaxonomyBO.parents_sql("obh.classif_id"), "object_annotation_hierarchy"
+            )
+
+        if "C" in req.tsv_entities:
+            select_clause.add_expr("obh.complement_info")
+
+        # Deal with mappings, the goal is to emit SQL which will reconstitute the TSV structure
+        mappingset = ProjectSetMapping().load_from_projects(src_projects)
+        if "O" in req.tsv_entities:
+            object_set.into_select_list(
+                select_clause,
+                "obf",
+                PREFIX_TO_TABLE["object"],
+                mappingset.object_mappings.tsv_cols_to_real,
+            )
+        if "S" in req.tsv_entities:
+            select_clause.add_expr("sam.orig_id", "sample_id").add_expr(
+                "sam.dataportal_descriptor", "sample_dataportal_descriptor"
+            )
+            object_set.into_select_list(
+                select_clause,
+                "sam",
+                PREFIX_TO_TABLE["sample"],
+                mappingset.sample_mappings.tsv_cols_to_real,
+            )
+        if "P" in req.tsv_entities:
+            select_clause.add_expr("prc.orig_id", "process_id")
+            object_set.into_select_list(
+                select_clause,
+                "prc",
+                PREFIX_TO_TABLE["process"],
+                mappingset.process_mappings.tsv_cols_to_real,
+            )
+        if "A" in req.tsv_entities:
+            select_clause.add_expr("acq.orig_id", "acq_id").add_expr(
+                "acq.instrument", "acq_instrument"
+            )
+            object_set.into_select_list(
+                select_clause,
+                "acq",
+                PREFIX_TO_TABLE["acq"],
+                mappingset.acquisition_mappings.tsv_cols_to_real,
+            )
+        if req.exp_type == ExportTypeEnum.dig_obj_ident:
+            select_clause.add_expr("obh.objid")
+        if req.with_internal_ids:
+            select_clause.add_expr("obh.objid").add_expr(
+                "obh.acquisid", "processid_internal"
+            ).add_expr("obh.acquisid", "acq_id_internal").add_expr(
+                "sam.sampleid", "sample_id_internal"
+            ).add_expr(
+                "obh.classif_id"
+            ).add_expr(
+                "obh.classif_who"
+            ).add_expr(
+                "CASE WHEN obh.classif_qual = 'P' THEN obh.classif_id END",
+                "classif_auto_id",
+            ).add_expr(
+                "txp.name", "classif_auto_name"
+            ).add_expr(
+                "obh.classif_score", "classif_auto_score"
+            ).add_expr(
+                "CASE WHEN obh.classif_qual = 'P' THEN obh.classif_date END",
+                "classif_auto_when",
+            ).add_expr(
+                "HASHTEXT(obh.orig_id)", "object_random_value"
+            ).add_expr(
+                "obh.sunpos", "object_sunpos"
+            )
+
+            if "S" in req.tsv_entities:
+                # This is not really an id, it's computed, why not
+                select_clause.add_expr("sam.latitude", "sample_lat").add_expr(
+                    "sam.longitude", "sample_long"
+                )
+
+        order_clause = OrderClause()
+        if req.split_by == "sample":
+            order_clause.add_expression("sam", "orig_id")
+            split_field = "sample_id"  # AKA sam.orig_id, but renamed in select list
+        elif req.split_by == "acquisition":
+            order_clause.add_expression("acq", "orig_id")
+            split_field = "acq_id"  # AKA acq.orig_id, but renamed in select list
+        elif req.split_by == "taxon":
+            order_clause.add_expression("txo", "display_name")
+            split_field = "object_annotation_category"
+        else:
+            order_clause.add_expression("sam", "orig_id")
+            split_field = "object_id"  # cette valeur permet d'éviter des erreurs plus loin dans r[split_field]
+        order_clause.add_expression("obh", "objid")
+
+        if req.with_images:
+            order_clause.add_expression(None, "img_rank")
+
+        # Base SQL comes from filters
+        from_, where, params = object_set.get_sql(
+            select_clause, order_clause, all_images=not req.only_first_image
+        )
+        # possible sql injection avec le replace
+        sql = (
+            select_clause.get_sql()
+            + " FROM "
+            + from_.get_sql().replace(":projid", str(params["projid"]))
+            + where.get_sql()
+            + "\n"
+            + order_clause.get_sql()
+        )
+        logger.info("Execute SQL : %s" % sql)
+        logger.info("Params : %s" % params)
+        res = self.ro_session.execute(text(sql), params)
+
+        now_txt = DateTime.now_time().strftime("%Y%m%d_%H%M")
+        self._set_out_file_name("zip")
+        produced_path = self.out_path / self.out_file_name
+        zfile = zipfile.ZipFile(
+            produced_path, "w", allowZip64=True, compression=zipfile.ZIP_DEFLATED
+        )
+
+        splitcsv = req.split_by != ""
+        csv_filename = "data.tsv"  # Just a temp name as there is a renaming while filling up the Zip
+        if splitcsv:
+            # Produce into the same temp file all the time, at zipping time the name in archive will vary
+            prev_value = "NotAssigned"  # To trigger a sequence change immediately
+        else:
+            # The zip will contain a single TSV with the same base name as the zip
+            prev_value = self.out_file_name.replace(".zip", "")
+
+        file_from_name = (
+            (lambda value: self.normalize_for_filename(str(value)))
+            if req.split_by == "taxon"
+            else lambda value: str(value)
+        )
+
+        csv_path: Path = (
+            self.out_path / csv_filename
+        )  # Constant path to a (sometimes) changing file
+        csv_fd: Optional[TextIO] = None
+        csv_wtr = None
+
+        # Store the images to save in a separate CSV. Useless if not exporting images but who cares.
+        temp_img_file = self.out_path / "images.csv"
+        img_file_fd = open(temp_img_file, "w")
+        img_wtr = csv.DictWriter(
+            img_file_fd,
+            ["src_path", "dst_path"],
+            delimiter="\t",
+            quotechar='"',
+            lineterminator="\n",
+        )
+        img_wtr.writeheader()
+
+        # Prepare TSV structure
+        col_descs = [
+            a_desc
+            for a_desc in res.cursor.description  # type:ignore # case2
+            if a_desc.name != "img_internal_id"
+        ]
+        # read latitude column to get float DB type
+        for a_desc in col_descs:
+            if a_desc.name == "object_lat":
+                db_float_type = a_desc.type_code
+                break
+        else:
+            db_float_type = (
+                None  # No such column if only annotations, but OTOH no float to format
+            )
+        float_cols_to_reformat = set()
+        # Prepare float separator conversion, if not required the set will just be empty
+        if req.coma_as_separator:
+            for a_desc in col_descs:
+                if a_desc.type_code == db_float_type:
+                    float_cols_to_reformat.add(a_desc.name)
+
+        tsv_cols = [a_desc.name for a_desc in col_descs]
+        tsv_types_line = {
+            name: ("[f]" if a_desc.type_code == db_float_type else "[t]")
+            for name, a_desc in zip(tsv_cols, col_descs)
+        }
+        nb_rows = 0
+        nb_images = 0
+        used_dst_pathes = set()
+        for r in res.mappings():
+            # Rows from SQLAlchemy are not mutable, so we need a clone for arranging values
+            a_row = dict(r)
+            if (
+                splitcsv and (prev_value != a_row[split_field])
+            ) or (  # At each split column values change
+                nb_rows == 0
+            ):  # And anyway for the first row
+                # Start of sequence, eventually end of previous sequence
+                if csv_fd:
+                    csv_fd.close()  # Close previous file
+                    self.store_tsv_into_zip(zfile, file_from_name(prev_value), csv_path)
+                if splitcsv:
+                    prev_value = a_row[split_field]
+                logger.info("Writing into temptask file %s", csv_filename)
+                if req.use_latin1:
+                    csv_fd = open(csv_path, "w", encoding="latin_1")
+                else:
+                    # Add a BOM marker signaling utf8, correctly guessed in all spreadsheet apps seen so far,
+                    # see https://docs.python.org/3/library/codecs.html
+                    csv_fd = open(csv_path, "w", encoding="utf-8-sig")
+                csv_wtr = csv.DictWriter(
+                    csv_fd,
+                    tsv_cols,
+                    delimiter="\t",
+                    quotechar='"',
+                    lineterminator="\n",
+                    quoting=csv.QUOTE_NONNUMERIC,
+                )
+                csv_wtr.writeheader()
+                if req.with_types_row:
+                    # Write types line for backup type or if forced
+                    csv_wtr.writerow(tsv_types_line)
+            if req.with_images:
+                image_path = Image.img_from_id_and_orig(
+                    a_row.pop("img_internal_id"), a_row["img_file_name"]
+                )
+                copy_op = {"src_path": image_path}
+                if req.exp_type == ExportTypeEnum.dig_obj_ident:
+                    # Images will be stored in a per-category directory, but there is a single TSV at the Zip root
+                    categ = a_row["object_annotation_category"]
+                    categ_id: Optional[int] = a_row["object_annotation_category_id"]
+                    # All names cannot directly become directories
+                    a_row["img_file_name"] = self.get_DOI_imgfile_name(
+                        a_row["objid"],
+                        a_row["img_rank"],
+                        categ,
+                        categ_id,
+                        a_row["img_file_name"],
+                    )
+                    copy_op["dst_path"] = a_row["img_file_name"]
+                else:  # It's a backup or TSV
+                    # Images are stored in the Zip subdirectory per sample/acq/taxo
+                    # - At the same place as their referring TSV for backups
+                    # - In a subdirectory for general TSV
+                    img_file_name = a_row["img_file_name"]
+                    dst_path = "{0}/{1}".format(
+                        file_from_name(prev_value), img_file_name
+                    )
+                    if dst_path in used_dst_pathes:
+                        # Avoid duplicates in zip as only the last entry will be present during unzip
+                        # root cause: for UVP6 bundles, the vignette and original image are both stored
+                        # with the same name.
+                        img_with_rank = "{0}/{1}".format(
+                            a_row["img_rank"], img_file_name
+                        )
+                        a_row["img_file_name"] = (
+                            img_with_rank  # write into TSV the corrected path
+                        )
+                        dst_path = "{0}/{1}".format(
+                            file_from_name(prev_value), img_with_rank
+                        )
+                    if req.exp_type == ExportTypeEnum.general_tsv:
+                        a_row["img_file_name"] = dst_path
+                    used_dst_pathes.add(dst_path)
+                    copy_op["dst_path"] = dst_path
+                img_wtr.writerow(copy_op)
+                nb_images += 1
+            # Remove CR from comments, means reimport will produce a != DB line
+            if "C" in req.tsv_entities and a_row["complement_info"]:
+                a_row["complement_info"] = " ".join(
+                    a_row["complement_info"].splitlines()
+                )
+            # Replace decimal separator
+            for cname in float_cols_to_reformat:
+                if a_row[cname] is not None:
+                    a_row[cname] = str(a_row[cname]).replace(".", ",")
+            assert csv_wtr is not None
+            # Produce the row in the TSV
+            csv_wtr.writerow(a_row)
+            nb_rows += 1
+            if nb_rows % self.ROWS_REPORT_EVERY == 0:
+                msg = "Row %d of max %d" % (nb_rows, obj_count)
+                logger.info(msg)
+                self.update_progress(int(1 + progress_range / obj_count * nb_rows), msg)
+        if csv_fd:
+            csv_fd.close()  # Close last file
+            self.store_tsv_into_zip(zfile, file_from_name(prev_value), csv_path)
+        logger.info("Extracted %d rows", nb_rows)
+        img_file_fd.close()
+        if zfile:
+            zfile.close()
+        return nb_rows, nb_images
+
+    def store_tsv_into_zip(self, zfile: ZipFile, file_part: str, in_file: Path) -> None:
+        # Add a new file into the zip
+        name_in_zip = "ecotaxa_" + file_part + ".tsv"
+        if self.req.exp_type == ExportTypeEnum.backup:
+            # In a subdirectory for backup type
+            name_in_zip = file_part + os.sep + name_in_zip
+        logger.info("Storing into zip as %s", name_in_zip)
+        zfile.write(in_file, arcname=name_in_zip)
+
+    def add_images(
+        self, nb_files_to_add, start_progress: int, end_progress: int
+    ) -> None:
+        # Add image files, linked to the TSV content
+        self.update_progress(start_progress, "Start Image export")
+        progress_range = end_progress - start_progress
+        logger.info("Appending to zip file %s" % self.out_file_name)
+        produced_path = self.out_path / self.out_file_name
+        zfile = zipfile.ZipFile(
+            produced_path, "a", allowZip64=True, compression=zipfile.ZIP_DEFLATED
+        )
+
+        nb_files_added = 0
+        vault = Vault(self.config.vault_dir())
+        temp_img_file = self.out_path / "images.csv"
+        with open(temp_img_file, "r") as temp_images_csv_fd:
+            for r in csv.DictReader(
+                temp_images_csv_fd, delimiter="\t", quotechar='"', lineterminator="\n"
+            ):
+                rel_image_path = r["src_path"]
+                img_file_path = vault.image_path(rel_image_path)
+                path_in_zip = r["dst_path"]
+                try:
+                    zfile.write(img_file_path, arcname=path_in_zip)
+                except FileNotFoundError:
+                    logger.error("Not found image: %s", img_file_path)
+                    continue
+                logger.info("Added vault file %s as %s", rel_image_path, path_in_zip)
+                nb_files_added += 1
+                if nb_files_added % self.IMAGES_REPORT_EVERY == 0:
+                    msg = "Added %d files" % nb_files_added
+                    logger.info(msg)
+                    progress = int(
+                        start_progress
+                        + progress_range / nb_files_to_add * nb_files_added
+                    )
+                    self.update_progress(progress, msg)
+            zfile.close()
+
+    def build_collection_zip(self) -> str:
+        """
+        Copy log file of present job into currently produced zip.
+        """
+        now_txt = DateTime.now_time().strftime("%Y%m%d_%H%M")
+        out_file_name = "export_collection_{0:s}_{1:s}{2:s}".format(
+            str(self.req.collection_id), now_txt, ".zip"
+        )
+        produced_path = self.out_path / out_file_name
+        zfile = zipfile.ZipFile(
+            produced_path, "a", allowZip64=True, compression=zipfile.ZIP_DEFLATED
+        )
+        import glob
+
+        logger.info("Root path {0:s}", self.temp_for_jobs.base_dir_for(self.job_id))
+        for zip in glob.glob(
+            self.temp_for_jobs.base_dir_for(self.job_id).as_posix() + "/*.zip"
+        ):
+            logger.info("Project file to zip {0:s}".format(zip))
+            zfile.write(zip)
+        zfile.close()
+        return out_file_name
+
+    def get_DOI_imgfile_name(
+        self,
+        objid: int,
+        imgrank: int,
+        taxofolder: Optional[str],
+        classif_id: Optional[int],
+        originalfilename,
+    ) -> str:
+        if not taxofolder:
+            taxofolder = "NoCategory"
+        else:
+            assert classif_id
+            taxofolder += "__%d" % classif_id
+        orig_file_name = "images/{0}/{1}_{2}{3}".format(
+            self.normalize_for_filename(taxofolder),
+            objid,
+            imgrank,
+            Path(originalfilename).suffix.lower(),
+        )
+        return orig_file_name
+
+    @staticmethod
+    def normalize_for_filename(name) -> str:
+        # noinspection RegExpRedundantEscape
+        return re.sub(R"[^a-zA-Z0-9 \.\-\(\)]", "_", str(name))
+
+    def _set_out_file_name(self, file_ext: str):
+        now_txt = DateTime.now_time().strftime("%Y%m%d_%H%M")
+        req = self.req
+        collection = (
+            hasattr(req, "collection_id")
+            and req.collection_id is not None
+            and int(req.collection_id) > 0
+        )
+        if collection == True:
+            objid = str(req.collection_id)
+        else:
+            objid = str(req.project_id)
+        if collection == True:
+            prefix = "collection_"
+        else:
+            prefix = ""
+        exp_type = req.exp_type.value
+        self.out_file_name = "export_{0:s}_{1:s}_{2:s}_{3:s}.{4:s}".format(
+            prefix, exp_type, objid, now_txt, file_ext
+        )
+
+    def _set_sci_summary_out_file_name(self) -> None:
+        now_txt = DateTime.now_time().strftime("%Y%m%d_%H%M")
+        projids = str(self.req.project_id).replace(",", "-")
+        self.out_file_name = "export_summary_%s_%s.tsv" % (projids, now_txt)
+
+    def _get_out_file(self):
+        out_file = self.temp_for_jobs.base_dir_for(self.job_id) / self.out_file_name
+        return out_file
+
+    def _get_summary_file(self):
+        self._set_out_file_name("tsv")
+        out_file = self._get_out_file()
+        return out_file
+
+    def _grouping_from_req(self, with_status_grouping: bool) -> ResultGrouping:
+        req_sum = self.req.sum_subtotal
+        if req_sum == SummaryExportGroupingEnum.just_by_taxon:
+            ret = ResultGrouping.BY_TAXO
+        elif req_sum == SummaryExportGroupingEnum.by_sample:
+            ret = ResultGrouping.BY_SAMPLE_AND_TAXO
+        elif req_sum == SummaryExportGroupingEnum.by_subsample:
+            ret = ResultGrouping.BY_SAMPLE_SUBSAMPLE_AND_TAXO
+        elif req_sum == SummaryExportGroupingEnum.by_project:
+            assert False, "No collections yet to get multiple projects"
+        else:
+            assert False, "Incorrect required grouping : %s" % req_sum
+        if with_status_grouping:
+            ret = ResultGrouping.with_status(ret)
+        return ret
+
+    def create_summary(self, project_ids: ProjectIDListT) -> int:
+        req = self.req
+        self.update_progress(1, "Start Summary export")
+        out_file = self._get_summary_file()
+        # Prepare a where clause and parameters from filter
+        object_set: DescribedObjectBOSet = DescribedObjectBOSet(
+            self.ro_session, project_ids, self._get_owner_id(), self.filters
+        )
+
+        # The specialized SQL builder
+        aug_qry = ObjectSetQueryPlus(object_set)
+        # We can set aliases even for expressions we don't select, so include all possibly needed ones
+        aug_qry.set_aliases(
+            {
+                "sam.orig_id": "sample_id",
+                "sam.latitude": "latitude",
+                "sam.longitude": "longitude",
+                "acq.orig_id": "acquis_id",
+                "MAX(obh.objdate)": "date",
+                "txo.display_name": "display_name",
+                aug_qry.COUNT_STAR: "nbr",
+            }
+        )
+
+        if req.sum_subtotal == SummaryExportGroupingEnum.just_by_taxon:
+            pass
+        elif req.sum_subtotal == SummaryExportGroupingEnum.by_sample:
+            aug_qry.add_selects(
+                ["sam.orig_id", "sam.latitude", "sam.longitude", "MAX(obh.objdate)"]
+            )
+        elif req.sum_subtotal == SummaryExportGroupingEnum.by_subsample:
+            aug_qry.add_selects(["sam.orig_id", "acq.orig_id"])
+        # We want the count, that's the goal of all this
+        aug_qry.add_selects(["txo.display_name", aug_qry.COUNT_STAR])
+        aug_qry.set_grouping(self._grouping_from_req(False))
+        msg = "Writing to file %s" % out_file
+        self.update_progress(50, msg)
+        nb_lines = aug_qry.write_result_to_csv(
+            self.ro_session, out_file, logger.warning
+        )
+
+        msg = "Extracted %d rows" % nb_lines
+        logger.info(msg)
+        self.update_progress(90, msg)
+
+        return nb_lines
+
+    def create_sci_abundances_summary(self, aug_qry: ObjectSetQueryPlus) -> str:
+        """
+        @see https://github.com/ecotaxa/ecotaxa/issues/615
+        """
+        self.update_progress(1, "Start Count Summary export")
+
+        # We want count, in the end of the line
+        aug_qry.set_aliases({aug_qry.COUNT_STAR: "count"})
+        aug_qry.add_selects([aug_qry.COUNT_STAR])
+
+        return "count"
+
+    def create_sci_concentrations_summary(self, aug_qry: ObjectSetQueryPlus) -> str:
+        """
+        @see https://github.com/ecotaxa/ecotaxa/issues/616
+        """
+        self.update_progress(1, "Start Concentrations Summary export")
+
+        # We want the sum of this formula calculation
+        formula = "1/subsample_coef/total_water_volume"
+        aug_qry.aggregate_with_computed_sum(
+            formula, Vocabulary.concentrations, Units.number_per_cubic_metre
+        )
+        # Specific alias
+        aug_qry.set_aliases({formula: "concentration"})
+
+        return "concentration"
+
+    def create_sci_biovolumes_summary(self, aug_qry: ObjectSetQueryPlus) -> str:
+        """
+        @see https://github.com/ecotaxa/ecotaxa/issues/617
+        """
+        self.update_progress(1, "Start Biovolumes Summary export")
+
+        # We want the sum of formula calculation, for each object
+        formula = "individual_volume/subsample_coef/total_water_volume"
+        aug_qry.aggregate_with_computed_sum(
+            formula, Vocabulary.biovolume, Units.cubic_millimetres_per_cubic_metre
+        )
+        # Specific alias
+        aug_qry.set_aliases({formula: "biovolume"})
+
+        return "biovolume"
+
+    def _zero_fill_reference_data(
+        self, object_set: DescribedObjectBOSet
+    ) -> Tuple[Set[Tuple], Dict[str, str]]:
+        """
+        Data needed to add zero-value rows to a sci-summary export: every sampling
+        unit (sample, or sample+acquisition) and the taxon -> hierarchy mapping.
+        Both depend only on the project and its filters, not on the requested
+        quantity, so the caller computes this once per project and reuses it for
+        every quantity requested for that project.
+        """
+        # Get all sampling_units (from the samples or subsamples AKA acquisition table)
+        sampling_units_qry = (
+            ObjectSetQueryPlus(object_set.without_filtering_taxo())
+            .add_selects(self._id_columns_from_req())
+            .set_aliases(self.SCI_SUMMARY_ID_ALIASES)
+            .set_grouping(ResultGrouping.without_taxo(self._grouping_from_req(True)))
+        )
+        out_id_cols = [
+            self.SCI_SUMMARY_ID_ALIASES[a_col]
+            for a_col in self._id_columns_from_req()
+        ]
+        all_sampling_units: Set[Tuple] = set()
+        # Tuples here have either one, two or three values
+        for a_row in sampling_units_qry.get_result(self.ro_session):
+            all_sampling_units.add(tuple([a_row[id_col] for id_col in out_id_cols]))
+        # Get possible taxa names, along with their hierarchy (for zero-filled rows)
+        txo_qry = (
+            ObjectSetQueryPlus(object_set)
+            .remap_categories(self.pre_mapping)
+            .add_selects(["txo.display_name", self.ANNOTATION_CATEGORY_HIERARCHY_SQL])
+            .set_aliases(
+                {
+                    "txo.display_name": "txo",
+                    self.ANNOTATION_CATEGORY_HIERARCHY_SQL: "annotation_category",
+                }
+            )
+            .set_grouping(ResultGrouping.BY_TAXO)
+        )
+        taxa_hierarchy: Dict[str, str] = {
+            a_row["txo"]: a_row["annotation_category"]
+            for a_row in txo_qry.get_row_source(self.ro_session)
+        }
+        return all_sampling_units, taxa_hierarchy
+
+    def add_zeroes_in_sci_summary(
+        self,
+        aug_qry: ObjectSetQueryPlus,
+        id_cols: List[str],
+        zero_col: str,
+        zero_fill_data: Optional[Tuple[Set[Tuple], Dict[str, str]]],
+    ):
+        """
+        Return relevant zero lines, for given non-zero input ones.
+        param: id_cols: The identifying columns in the query.
+        param: zero_col: The column to fill with 0 in the output.
+        param: zero_fill_data: precomputed (all_sampling_units, taxa_hierarchy),
+            shared across every quantity of the current project, or None if the
+            request's grouping doesn't need zero-filling at all.
+        """
+        if zero_fill_data is not None:
+            all_sampling_units, taxa_hierarchy = zero_fill_data
+            # Produce the zero-less report
+            without_zeroes = aug_qry.get_result(self.ro_session, logger.warning)
+            # Columns are aliased so the output columns are named differently
+            out_id_cols = [aug_qry.defs_to_alias[a_col] for a_col in id_cols]
+            not_presents = self.not_presents_in_sci_summary(
+                without_zeroes,
+                out_id_cols,
+                zero_col,
+                all_sampling_units,
+                taxa_hierarchy,
+            )
+            without_zeroes.extend(not_presents)
+            without_zeroes.sort(
+                key=lambda a_row: tuple(
+                    [a_row[id_col] for id_col in out_id_cols + ["taxonid"]]
+                )
+            )
+            row_src: IterableRowsT = without_zeroes
+        else:
+            # We can write the query output
+            row_src = aug_qry.get_row_source(self.ro_session, logger.warning)
+        return row_src
+
+    def not_presents_in_sci_summary(
+        self,
+        without_zeroes: List[Dict[str, Any]],
+        id_cols: List[str],
+        zero_col: str,
+        all_sampling_units: Set[Tuple],
+        taxa_hierarchy: Dict[str, str],
+    ):
+        """
+        Produce lines with 0 count/concentration/biovolume for relevant (sample, status, category) triplets
+        or (sample, acquisition, status, category) tuples.
+        Specs: https://github.com/ecotaxa/ecotaxa/issues/615#issuecomment-1158781701
+        """
+        taxa = taxa_hierarchy.keys()
+        # Prepare the cross fill, all with tuples which are hash-able
+        presents: Set[Tuple[Tuple, str]] = set()
+        # Build (sampling unit, taxon) pairs from zero-less report
+        for a_row in without_zeroes:
+            sampling_unit_id, taxonid = (
+                tuple([a_row[id_col] for id_col in id_cols]),
+                a_row["taxonid"],
+            )
+            presents.add((sampling_unit_id, taxonid))
+        # Cross-fill
+        not_presents: List[Dict[str, Any]] = []
+        for sampling_unit_id in all_sampling_units:
+            for taxonid in taxa:
+                if (sampling_unit_id, taxonid) not in presents:
+                    a_not_present = {
+                        id_col: id_col_val
+                        for id_col, id_col_val in zip(id_cols, sampling_unit_id)
+                    }
+                    a_not_present.update(
+                        {
+                            "taxonid": taxonid,
+                            "annotation_category": taxa_hierarchy[taxonid],
+                            zero_col: 0,
+                        }
+                    )
+                    not_presents.append(a_not_present)
+        return not_presents
+
+    def _id_columns_from_req(self) -> List[str]:
+        ret = []
+        req = self.req
+        if req.sum_subtotal == SummaryExportGroupingEnum.just_by_taxon:
+            pass
+        elif req.sum_subtotal == SummaryExportGroupingEnum.by_sample:
+            ret = ["sam.orig_id"]
+        elif req.sum_subtotal == SummaryExportGroupingEnum.by_subsample:
+            ret = ["sam.orig_id", "acq.orig_id"]
+        return ret + ["obh.classif_qual"]
+
+    def _new_sci_summary_query(
+        self,
+        object_set: DescribedObjectBOSet,
+        formulae: Dict[str, str],
+        id_cols: List[str],
+    ) -> ObjectSetQueryPlus:
+        """
+        Build a fresh, isolated query for a single sci-summary type, out of a
+        (project, filters) description shared by every quantity of that project.
+        """
+        aug_qry = ObjectSetQueryPlus(object_set)
+        aug_qry.remap_categories(self.pre_mapping)
+        aug_qry.set_formulae(formulae)
+        # Set common aliases, not all of them is always used
+        aug_qry.set_aliases(self.SCI_SUMMARY_ID_ALIASES)
+        aug_qry.add_selects(id_cols)
+        aug_qry.add_selects(["txo.display_name", self.ANNOTATION_CATEGORY_HIERARCHY_SQL])
+        return aug_qry
+
+    def _project_formulae(self, project_id: ProjectIDT) -> Dict[str, str]:
+        """
+        This project's own computation formulae (how to get abundance/concentration/
+        biovolume variables from its free columns), overridden by any formula given
+        in the request. Each project keeps its own definitions: with several projects
+        involved, they are not merged/shared across each other. Can come back empty,
+        e.g. for an abundance-only export, which needs none -- see
+        _check_sci_summary_formulae for the actual per-quantity requirement check.
+        """
+        req = self.req
+        formulae: Dict[str, str] = {}
+        prjformulae = (
+            self.ro_session.query(Project.formulae)
+            .filter(Project.projid == project_id)
+            .scalar()
+        )
+        if prjformulae:
+            formulae.update(prjformulae)
+        try:
+            formulae.update(req.formulae)
+        except Exception:
+            pass
+        return formulae
+
+    def _check_sci_summary_formulae(
+        self,
+        project_ids: ProjectIDListT,
+        exp_types: List[ExportTypeEnum],
+        formulae_by_project: Dict[ProjectIDT, Dict[str, str]],
+    ) -> None:
+        """
+        Validate, upfront, that each project's formulae cover what each requested
+        quantity needs (see BO.ProjectVars.REQUIRED_VARS_PER_QUANTITY), so the job
+        fails fast with a clear message instead of a deep, cryptic formula-evaluation
+        error part-way through the export.
+        """
+        problems = []
+        for project_id in project_ids:
+            formulae = formulae_by_project[project_id]
+            for exp_type in exp_types:
+                missing = [
+                    a_var
+                    for a_var in REQUIRED_VARS_PER_QUANTITY[exp_type.value]
+                    if a_var not in formulae
+                ]
+                if missing:
+                    problems.append(
+                        "project %s: cannot compute '%s', missing formula(e) for: %s"
+                        % (
+                            project_id,
+                            QUANTITY_NAMES[exp_type.value],
+                            ", ".join(missing),
+                        )
+                    )
+        if problems:
+            raise Exception("Incomplete formulae:\n" + "\n".join(problems))
+
+    def create_sci_summary(
+        self, project_ids: ProjectIDListT, exp_types: List[ExportTypeEnum]
+    ) -> int:
+        """
+        Assuming that the historical summary is a data one, compute 'scientific' summaries.
+        A single TSV is produced, with one column per requested quantity ('count' AKA
+        abundance, concentration, biovolume), in the order they were requested, on top of
+        the common id columns (project_id if several projects, sample_id, acq_id, status, taxon).
+        With several projects, one query is run per (project, quantity) pair -- each using
+        that project's own formulae -- and results are merged together, as if several
+        single-project exports were concatenated.
+        """
+        req = self.req
+        user_id = self._get_owner_id()
+        self._multi_project = len(project_ids) > 1
+        # Ensure we work on validated objects only.
+        # Not anymore, should user need to narrow the export the filters are available.
+        # self.filters["statusfilter"] = "V"
+        if req.sum_subtotal == SummaryExportGroupingEnum.by_project:
+            assert False, "No collections yet to get multiple projects from"
+
+        id_cols = self._id_columns_from_req()
+        # The columns identifying a row, common to every requested quantity.
+        key_cols = (
+            (["project_id"] if self._multi_project else [])
+            + [self.SCI_SUMMARY_ID_ALIASES[a_col] for a_col in id_cols]
+            + ["taxonid", "annotation_category"]
+        )
+
+        formulae_by_project = {
+            project_id: self._project_formulae(project_id) for project_id in project_ids
+        }
+        self._check_sci_summary_formulae(project_ids, exp_types, formulae_by_project)
+
+        nb_steps = len(project_ids) * len(exp_types)
+        step = 0
+        # key (project_id? + id_cols + taxon values) -> output row, filled quantity by quantity
+        merged_rows: "Dict[Tuple, Dict[str, Any]]" = {}
+        quantity_cols: List[str] = []
+        for project_id in project_ids:
+            formulae = formulae_by_project[project_id]
+            object_set = DescribedObjectBOSet(
+                self.ro_session, [project_id], user_id, self.filters
+            )
+            # Sampling units and taxon->hierarchy mapping depend only on the project
+            # and its filters, not on the requested quantity, so compute them once
+            # here and reuse for every quantity below, instead of once per quantity.
+            zero_fill_data = None
+            if req.sum_subtotal in (
+                SummaryExportGroupingEnum.by_sample,
+                SummaryExportGroupingEnum.by_subsample,
+            ):
+                zero_fill_data = self._zero_fill_reference_data(object_set)
+            for exp_type in exp_types:
+                # A fresh query per (project, type), so a project's own formulae
+                # never leaks into another project's, nor one type's into another's.
+                aug_qry = self._new_sci_summary_query(object_set, formulae, id_cols)
+                if exp_type == ExportTypeEnum.abundances:
+                    zero_col = self.create_sci_abundances_summary(aug_qry)
+                elif exp_type == ExportTypeEnum.concentrations:
+                    zero_col = self.create_sci_concentrations_summary(aug_qry)
+                elif exp_type == ExportTypeEnum.biovols:
+                    zero_col = self.create_sci_biovolumes_summary(aug_qry)
+                else:
+                    raise Exception("Unsupported export type : %s" % exp_type)
+                if zero_col not in quantity_cols:
+                    quantity_cols.append(zero_col)
+                # Group according to request
+                aug_qry.set_grouping(self._grouping_from_req(True))
+
+                msg = "Computing zero lines to add for %s, project %s" % (
+                    exp_type.value,
+                    project_id,
+                )
+                logger.info(msg)
+                step += 1
+                self.update_progress(10 + int(70 / nb_steps * step), msg)
+                row_src = self.add_zeroes_in_sci_summary(
+                    aug_qry, id_cols, zero_col, zero_fill_data
+                )
+
+                nb_lines = 0
+                for a_row in row_src:
+                    if self._multi_project:
+                        a_row["project_id"] = project_id
+                    key = tuple(a_row[a_col] for a_col in key_cols)
+                    merged_row = merged_rows.get(key)
+                    if merged_row is None:
+                        merged_row = {a_col: a_row[a_col] for a_col in key_cols}
+                        merged_rows[key] = merged_row
+                    merged_row[zero_col] = a_row[zero_col]
+                    nb_lines += 1
+
+                logger.info(
+                    "Extracted %d rows for %s, project %s",
+                    nb_lines,
+                    exp_type.value,
+                    project_id,
+                )
+
+        self.update_progress(90, "Packaging result")
+        self._set_sci_summary_out_file_name()
+        out_file = self.out_path / self.out_file_name
+        logger.info("Writing to file %s", out_file)
+        out_cols = key_cols + quantity_cols
+        with open(out_file, "w") as csv_fd:
+            wtr = csv.DictWriter(
+                csv_fd,
+                out_cols,
+                delimiter="\t",
+                quotechar='"',
+                lineterminator="\n",
+                restval=0,
+            )
+            wtr.writeheader()
+            # None-safe sort key, as e.g. status can be NULL for unclassified objects
+            for key in sorted(
+                merged_rows.keys(),
+                key=lambda a_key: tuple((v is None, v) for v in a_key),
+            ):
+                wtr.writerow(merged_rows[key])
+
+        total_lines = len(merged_rows)
+        self.update_progress(100, "Extracted %d rows" % total_lines)
+        return total_lines
+
+    def query_taxo_recast(
+        self,
+        target_id: Union[ProjectIDT, CollectionIDT],
+        operation: RecastOperation,
+        is_collection: bool = False,
+    ) -> Optional[Dict[ClassifIDT, Optional[ClassifIDT]]]:
+        qry = self.ro_session.query(TaxoRecast)
+        qry = qry.filter(TaxoRecast.operation == operation)
+        if is_collection:
+            qry = qry.filter(TaxoRecast.collection_id == target_id)
+        else:
+            qry = qry.filter(TaxoRecast.project_id == target_id)
+        res = qry.all()
+        if res is None or len(res) != 1:
+            return None
+        the_one = json.loads(res[0].transforms)
+        transforms: Dict[ClassifIDT, Optional[ClassifIDT]] = {}
+        for k, v in the_one.items():
+            if v is None:
+                val = 0
+            else:
+                val = int(v)
+            transforms.update({int(k): val})
+        return transforms
+
+
+class SpecializedProjectExport(ProjectExport):
+    """A specialized kind of export, transferring params to main one"""
+
+    def __init__(self, req: Any, filters: ProjectFiltersDict):
+        super().__init__(self.new_to_old(req), filters)
+        self.sreq = req  # The specialized request
+
+    @staticmethod
+    @abc.abstractmethod
+    def new_to_old(req: Any) -> ExportReq:
+        pass
+
+    def init_args(self, args: ArgsDict) -> ArgsDict:
+        args["req"] = self.sreq.dict()  # Serialize the specialized version
+        args["filters"] = self.filters
+        return args
+
+
+class GeneralProjectExport(SpecializedProjectExport):
+    JOB_TYPE = "GeneralExport"
+
+    @staticmethod
+    def new_to_old(req: GeneralExportReq) -> ExportReq:
+        old_split = (
+            req.split_by
+            if req.split_by
+            in (
+                ExportSplitOptionsEnum.sample,
+                ExportSplitOptionsEnum.acquisition,
+                ExportSplitOptionsEnum.taxon,
+            )
+            else ""
+        )
+        return ExportReq(
+            collection_id=req.collection_id,
+            project_id=req.project_id,
+            exp_type=ExportTypeEnum.general_tsv,
+            with_images=req.with_images != ExportImagesOptionsEnum.none,
+            with_internal_ids=req.with_internal_ids,
+            with_types_row=req.with_types_row,
+            only_first_image=req.with_images == ExportImagesOptionsEnum.first,
+            split_by=old_split,
+            tsv_entities="OPAS" if req.with_types_row else "OPASC",
+            only_annotations=req.only_annotations,
+            out_to_ftp=req.out_to_ftp,
+        )
+
+    @staticmethod
+    def deser_args(json_args: ArgsDict) -> None:
+        json_args["req"] = GeneralExportReq(**json_args["req"])
+
+
+class SummaryProjectExport(SpecializedProjectExport):
+    JOB_TYPE = "SummaryExport"
+
+    @staticmethod
+    def new_to_old(req: SummaryExportReq) -> ExportReq:
+        new_level_to_old = {
+            SummaryExportSumOptionsEnum.none: SummaryExportGroupingEnum.just_by_taxon,
+            SummaryExportSumOptionsEnum.sample: SummaryExportGroupingEnum.by_sample,
+            SummaryExportSumOptionsEnum.acquisition: SummaryExportGroupingEnum.by_subsample,
+        }
+        raw_quantity: List[Union[ExportTypeEnum, SummaryExportQuantitiesOptionsEnum]]
+        if isinstance(
+            req.quantity, (SummaryExportQuantitiesOptionsEnum, ExportTypeEnum)
+        ):
+            raw_quantity = [req.quantity]
+        elif isinstance(req.quantity, list):
+            raw_quantity = list(req.quantity)
+        else:
+            raw_quantity = [ExportTypeEnum.abundances]
+        quantity: List[Union[ExportTypeEnum, SummaryExportQuantitiesOptionsEnum]] = [
+            (
+                SUMMARY_QUANTITY_TO_EXPORT_TYPE[a_type]
+                if isinstance(a_type, SummaryExportQuantitiesOptionsEnum)
+                else a_type
+            )
+            for a_type in raw_quantity
+        ]
+        return ExportReq(
+            collection_id=req.collection_id,
+            project_id=req.project_id,
+            exp_type=ExportTypeEnum.summary,
+            quantity=quantity,
+            sum_subtotal=new_level_to_old[req.summarise_by],
+            formulae=req.formulae,
+            out_to_ftp=req.out_to_ftp,
+        )
+
+    @staticmethod
+    def deser_args(json_args: ArgsDict) -> None:
+        json_args["req"] = SummaryExportReq(**json_args["req"])
+
+
+class BackupProjectExport(SpecializedProjectExport):
+    JOB_TYPE = "BackupExport"
+
+    @staticmethod
+    def new_to_old(req: BackupExportReq) -> ExportReq:
+        return ExportReq(
+            collection_id=req.collection_id,
+            project_id=req.project_id,
+            exp_type=ExportTypeEnum.backup,
+            with_images=True,
+            out_to_ftp=req.out_to_ftp,
+        )
+
+    @staticmethod
+    def deser_args(json_args: ArgsDict) -> None:
+        json_args["req"] = BackupExportReq(**json_args["req"])

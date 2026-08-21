@@ -1,0 +1,54 @@
+<table class="classiftab" width="98%">
+  {% for v in res %}
+    <tr>
+      <td data-taxoid="{{ v['id'] }}" data-dispname="{{ v['display_name'] }}"
+          class="{{ v['parentclasses'] }} {{ 'zerocount' if v['nbr']==0 }}">
+        {% if v['haschild'] %}
+          <small><span style="width: 1em;" class="glyphicon glyphicon-triangle-bottom categexpander"></span></small>
+        {% endif %}
+        <span class="{% if v['deprecated']%}deprecated{% endif %} taxodrop {% if v['haschild'] %}haschild{% endif %}"
+              style="margin-left: {{ (0 if v['haschild'] else 1)+ v['dist']*0.9 }}em" >
+    {{ v['htmldisplayname'] }}
+</span>
+        <span class="taxoparent">{{ v['taxoparent']|safe }}</span>
+        {% if v['guide']>0 %}
+        <a href="https://ecotaxoguide.imev-mer.fr/taxonomic-sheets/{{v['guide']}}#"
+           target="_blank" onclick="event.stopImmediatePropagation();" class="taxo-guide-link"
+           title="Open Taxonomic Sheet" aria-label="Open Taxonomic Sheet">
+        &nbsp;<span class="glyphicon glyphicon-eye-open" style="color: #999"></span>&nbsp;
+        </a>
+        {% endif %}
+        <div class="counterarea">
+          <span class="counter label label-success">{{ v['nbr_v'] }}</span>
+          {% if v['nbr_p']>0 %}
+            <span class="counternotv label label-info">{{ v['nbr_p'] }}</span>
+          {% endif %}
+          {% if v['nbr_d']>0 %}
+            <span class="counternotv label label-warning">{{ v['nbr_d'] }}</span>
+          {% endif %}
+        </div>
+      </td>
+    </tr>
+  {% endfor %}
+</table>
+
+<script>
+    // a dict with key=taxon id, value=a list containing [t.id, t.name, t.parent_id]
+    var taxotree = {{ taxotree|safe }};
+    const projid={{projid}};
+      const fixcat=$('<span class="zindex-tooltip border border-light rounded shadow-sm p-4 mb-4 bg-info text-sm "><i class="fas fa-wrench p-4"><a class="text-white" href="{{url_for('deprecation_management',prj_id=projid)}}">{{_('Fix deprecated categories')}}</a></i></span>').hide();
+     $('body').append(fixcat);
+      $('.deprecated').on( 'mouseover', function() {
+        var pos = $(this).offset();
+        pos.top-= 18
+        pos.left-= 4
+        fixcat.css({
+            position: 'absolute',
+            top: parseInt(pos.top)+'px',
+            left: parseInt(pos.left)+'px',
+            }).show();
+        });
+    fixcat.on( 'mouseout', function() {
+        fixcat.hide();
+        });
+</script>

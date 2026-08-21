@@ -1,0 +1,328 @@
+# -*- coding: utf-8 -*-
+# This file is part of Ecotaxa, see license.md in the application root directory for license informations.
+# Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
+#
+# End-user services around taxonomy tree.
+#
+import json
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Union
+
+from fastapi import HTTPException
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
+
+from API_models.taxonomy import (
+    TaxaSearchRsp,
+    TaxonomyRecastReq,
+    TaxoRecastRsp,
+    TaxoRecastSearchRsp,
+)
+from API_operations.helpers.Service import Service
+from BO.Classification import ClassifIDT, ClassifIDListT
+from BO.Collection import CollectionIDT
+from BO.Project import ProjectBO, ProjectBOSet
+from BO.ReClassifyLog import ReClassificationBO
+from BO.Rights import RightsBO
+from BO.TaxoRecast import TaxoRecastBO
+from BO.Taxonomy import TaxonomyBO, TaxonBO, TaxonBOSet, WoRMSBO
+from BO.User import UserBO
+from BO.WoRMSification import WoRMSifier
+from DB.Project import ProjectTaxoStat, Project, ProjectIDT
+from DB.TaxoRecast import TaxoRecast, RecastOperation
+from DB.Taxonomy import Taxonomy
+from DB.User import User, UserIDT
+from helpers.DynamicLogs import get_logger
+
+logger = get_logger(__name__)
+
+
+class TaxonomyService(Service):
+    """ """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def status(self, _current_user_id: UserIDT) -> Optional[datetime]:
+        """
+        Return the freshness status of the taxonomy tree.
+        Fresh == recently updated from the Taxonomy server.
+        """
+        tree_info = TaxonomyBO.get_tree_status(self.session)
+        # The column is NULL-able so this can happen:
+        # tree_info.lastserverversioncheck_datetime is None
+        return tree_info.lastserverversioncheck_datetime
+
+    def search(
+        self, current_user_id: Optional[UserIDT], prj_id: Optional[int], query: str
+    ) -> List[TaxaSearchRsp]:
+        """
+        See caller doctext for specifications.
+        """
+        query_len = len(query)
+        # Arrange query
+        query = query.lower()
+        # " " and "*" mean "any chars"
+        query = query.replace("*", "%").replace(" ", "%")
+        # Old sophisticated version which allowed lineage search using '<' separator
+        # It's possible to ask for both child & parent at the same time, using "<"
+        # So "<" is kind of operator "descending of"
+        # terms = [sub + r"%" if (not sub or sub[-1] != '%') else sub  # Semantic is 'start with'
+        #          for sub in query.split("<")]
+        # Conventionally, the first term is a filter on display_name
+        display_name_term = query + "%"  # terms[0]
+        name_terms: List[str] = []  # terms[1:]
+
+        # Compose the query from different case
+        limit_ids_to = None
+        include_ids = []
+        return_order = {}
+        # Get preset list, to favor in result order
+        preset = set()
+        if prj_id is not None:
+            the_prj = ProjectBOSet.get_one(self.ro_session, prj_id)
+            if the_prj is not None:
+                include_ids = the_prj.get_preset()
+                preset = set(include_ids)
+        if current_user_id is None:
+            # Unauthenticated call
+            if query_len < 3:
+                limit_ids_to = []  # No MRU, no output whatever filters
+        else:
+            # Authenticated call
+            if query_len < 3 and prj_id is not None:
+                # The query will limit to mru list, if 0 length then it's % i.e. all
+                limit_ids_to = UserBO.get_mru(self.session, current_user_id, prj_id)
+                # And arrange they are in first
+                return_order = {cl_id: num for num, cl_id in enumerate(limit_ids_to)}
+        # Do the query
+        res = TaxonomyBO.query(
+            self.ro_session, limit_ids_to, include_ids, display_name_term, name_terms
+        )
+        mru_ret = []
+        preset_ret = []
+        others_ret = []
+        # Carefully order the result
+        for a_rec in res:
+            classif_id = a_rec["id"]
+            renm_id = a_rec["rename_to"]
+            is_preset = 1 if classif_id in preset else 0
+            to_add = TaxaSearchRsp(
+                id=classif_id,
+                aphia_id=a_rec["aphia_id"],
+                status=a_rec["taxostatus"],
+                renm_id=renm_id,
+                text=a_rec["display_name"],
+                pr=is_preset,
+            )
+            if classif_id in return_order:
+                mru_ret.append(to_add)
+            elif is_preset:
+                preset_ret.append(to_add)
+            else:
+                others_ret.append(to_add)
+        mru_ret.sort(key=lambda r: return_order[r.id])
+        return mru_ret + preset_ret + others_ret
+
+    def query_roots(self) -> List[TaxonBO]:
+        """
+        Return root (no parents) categories/taxa.
+        """
+        qry = self.ro_session.query(Taxonomy.id)
+        qry = qry.filter(Taxonomy.parent_id.is_(None))
+        root_ids = [taxon_id for taxon_id, in qry]
+        return self.query_set(root_ids)
+
+    def query(self, taxon_id: ClassifIDT) -> Optional[TaxonBO]:
+        ret = self.query_set([taxon_id])
+        if not ret:
+            return None
+        else:
+            return ret[0]
+
+    def query_usage(self, taxon_id: ClassifIDT) -> List[Dict[str, Any]]:
+        taxo_and_prjs_qry = self.session.query(
+            ProjectTaxoStat.nbr_v, Project.projid, Project.title
+        )
+        taxo_and_prjs_qry = taxo_and_prjs_qry.filter(
+            (Project.projid == ProjectTaxoStat.projid)
+            & (ProjectTaxoStat.nbr_v > 0)
+            & (ProjectTaxoStat.id == taxon_id)
+        )
+        taxo_and_prjs_qry = taxo_and_prjs_qry.order_by(ProjectTaxoStat.nbr_v.desc())
+        logger.info("qry:%s", taxo_and_prjs_qry)
+        ret = [
+            {"projid": projid, "title": title, "nb_validated": nbr_v}
+            for nbr_v, projid, title in taxo_and_prjs_qry
+        ]
+        return ret
+
+    def query_set(self, taxon_ids: ClassifIDListT) -> List[TaxonBO]:
+        ret = TaxonBOSet(self.ro_session, taxon_ids)
+        return ret.as_list()
+
+    def wormsification_set(self, taxaids: ClassifIDListT) -> Dict[int, WoRMSBO]:
+        wormsauto = self.get_taxonomy_worms(taxaids)
+        targets = WoRMSifier.do_wormsify(self.ro_session, list(wormsauto.values()))
+        return targets
+
+    def get_taxonomy_worms(self, taxaids: ClassifIDListT) -> Dict[str, int]:
+        wormsifier: WoRMSifier = WoRMSifier()
+        wormsifier.do_match(self.ro_session, taxaids)
+        taxo_worms_auto: Dict[str, int] = {}
+        for k, v in wormsifier.phylo2worms.items():
+            if v is not None:
+                taxo_worms_auto.update({str(k): v})
+        for taxonid, to in wormsifier.morpho2phylo.items():
+            if to is not None and taxonid > 0:
+                toworms = wormsifier.phylo2worms[int(to)]
+                if toworms is not None:
+                    taxo_worms_auto.update({str(taxonid): toworms})
+        return taxo_worms_auto
+
+    def update_taxonomy_recast(
+        self, current_user_id: UserIDT, recast: TaxonomyRecastReq
+    ):
+        # Just remove and re-add
+        if recast.operation not in RecastOperation.__members__:
+            raise HTTPException(
+                HTTP_422_UNPROCESSABLE_ENTITY, detail="operation not supported"
+            )
+        qry = TaxoRecastBO.query_recast(
+            self.session,
+            current_user_id,
+            target_id=recast.target_id,
+            operation=recast.operation,
+            is_collection=recast.is_collection,
+            for_update=True,
+        )
+        if qry is not None:
+            qry.delete()
+        new_recast = TaxoRecast()
+        if recast.is_collection:
+            new_recast.collection_id = recast.target_id
+        else:
+            new_recast.project_id = recast.target_id
+        new_recast.operation = recast.operation
+        isworms = recast.operation in [
+            RecastOperation.dwca_export_occurrence,
+            RecastOperation.dwca_export_emof,
+        ]
+        self.validate_remapping_throw(recast.recast.from_to, isworms)
+        new_recast.transforms = json.dumps(recast.recast.from_to)
+        new_recast.documentation = (
+            json.dumps(recast.recast.doc) if recast.recast.doc else {}
+        )
+        self.session.add(new_recast)
+        self.session.commit()
+
+    def get_taxonomy_recast(
+        self,
+        current_user_id: UserIDT,
+        target_id: Union[ProjectIDT, CollectionIDT],
+        operation: RecastOperation,
+        is_collection: bool = False,
+    ) -> Optional[TaxoRecastRsp]:
+        assert operation in RecastOperation.__members__, HTTP_422_UNPROCESSABLE_ENTITY
+        qry = TaxoRecastBO.query_recast(
+            self.ro_session,
+            current_user_id,
+            target_id,
+            operation,
+            is_collection,
+            for_update=False,
+        ).all()
+        res = qry
+        if res is None or len(res) != 1:
+            return None
+        the_one: TaxoRecast = res[0]
+        ret = TaxoRecastRsp(
+            from_to=json.loads(str(the_one.transforms)),
+            doc=json.loads(str(the_one.documentation)),
+        )
+
+        return ret
+
+    def search_taxonomy_recast(
+        self,
+        current_user_id: UserIDT,
+        project_ids: Optional[List[ProjectIDT]],
+        operation: RecastOperation,
+    ) -> List[TaxoRecastSearchRsp]:
+        """Among project_ids, return the existing taxonomy recast records, with project
+        title, for the given operation. If project_ids is not given, consider all the
+        projects readable/administered by the current user.
+        Permission check is done once, in bulk, by ProjectBO.projects_for_user (single
+        SQL query), instead of one permission check per project."""
+        assert operation in RecastOperation.__members__, HTTP_422_UNPROCESSABLE_ENTITY
+        current_user: User = RightsBO.get_user_throw(self.ro_session, current_user_id)
+        id_filter = ",".join(str(prj_id) for prj_id in project_ids) if project_ids else ""
+        allowed_project_ids = ProjectBO.projects_for_user(
+            self.ro_session, current_user, project_ids=id_filter
+        )
+        rows = TaxoRecastBO.search_recast(
+            self.ro_session, allowed_project_ids, operation
+        )
+        return [
+            TaxoRecastSearchRsp(
+                recast_id=recast.recast_id,
+                collection_id=recast.collection_id,
+                project_id=recast.project_id,
+                project_title=title,
+                operation=recast.operation,
+                transforms=self._as_dict(recast.transforms),
+                documentation=self._as_dict(recast.documentation),
+            )
+            for recast, title in rows
+        ]
+
+    @staticmethod
+    def _as_dict(jsonb_value: Any) -> Optional[dict]:
+        """The JSONB columns of taxo_recast can hold either a native object or,
+        for historical reasons, a JSON-encoded string. Normalize to a dict."""
+        if isinstance(jsonb_value, str):
+            return json.loads(jsonb_value)
+        return jsonb_value
+
+    def most_used_non_advised(
+        self, _current_user_id: Optional[UserIDT], taxon_ids: ClassifIDListT
+    ) -> List[TaxonBO]:
+        prev_choices = ReClassificationBO.previous_choices(self.ro_session, taxon_ids)
+        ret_taxa = []
+        for a_taxon_id in taxon_ids:
+            # If no relevant previous choice, return source
+            found_choice = prev_choices.get(a_taxon_id, a_taxon_id)
+            ret_taxa.append(found_choice)
+        # Index as we need exact order
+        ret_dict = {
+            a_taxon.id: a_taxon
+            for a_taxon in TaxonBOSet(self.ro_session, ret_taxa).taxa
+        }
+        return [ret_dict[txid] for txid in ret_taxa]
+
+    def reclassification_history(
+        self, _current_user_id: Optional[UserIDT], project_id: ProjectIDT
+    ) -> List[Dict[str, Any]]:
+        history = ReClassificationBO.history_for_project(self.ro_session, project_id)
+        return history
+
+    def validate_remapping_throw(
+        self, remapping: Dict[str, Optional[int]], isWoRMS: bool
+    ):
+        resp = TaxoRecastBO.valid_remap(remapping)
+        if resp is not None:
+            raise HTTPException(HTTP_422_UNPROCESSABLE_ENTITY, detail=[resp])
+        if isWoRMS:
+            qry = (
+                self.ro_session.query(Taxonomy.id)
+                .filter(Taxonomy.id.in_(remapping.values()))
+                .filter(Taxonomy.aphia_id is None)
+            )
+            not_valid = [t.id for t in qry]
+            if len(not_valid):
+                raise HTTPException(
+                    HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=[
+                        " error  taxa recast is not WoRMS compatible "
+                        + ", ".join(not_valid)
+                    ],
+                )
