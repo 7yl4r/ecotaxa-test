@@ -15,7 +15,9 @@ services:
     restart: unless-stopped
 
   ecotaxafront:
-    image: ecotaxa/ecotaxa_front:latest
+    build:
+      context: ./services/ecotaxa_front/docker
+      dockerfile: prod_image/Dockerfile
     container_name: ecotaxa_front
     volumes:
       - ./front_config:/app/config
@@ -26,7 +28,9 @@ services:
     restart: unless-stopped
 
   ecotaxaback:
-    image: ecotaxa/ecotaxa_back:latest
+    build:
+      context: ./services/ecotaxa_back/docker
+      dockerfile: prod_image/Dockerfile
     container_name: ecotaxa_back
     volumes:
       - ./back_config.ini:/config.ini
@@ -45,13 +49,16 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # GPU-accelerated back-end for CNN-based prediction/segmentation jobs.
-  # Requires an NVIDIA GPU + the NVIDIA Container Toolkit on the host.
-  # Enable with: docker compose --profile gpu up -d
+  # ML back-end: polls the shared job table directly and runs Prediction jobs
+  # (Random Forest training/classification, plus deep-CNN feature extraction
+  # if a GPU is available). Runs CPU-only here (no NVIDIA GPU on this host) --
+  # the classical RF path doesn't need one, only the deep-features ("Add deep
+  # features" in the Prediction wizard) path does.
   ecotaxagpuback:
-    image: ecotaxa/ecotaxa_gpu_back:latest
+    build:
+      context: ./services/ecotaxa_ML_back
+      dockerfile: docker/prod_image/Dockerfile
     container_name: ecotaxa_gpu_back
-    profiles: ["gpu"]
     volumes:
       - ./back_config.ini:/config.ini
       - ./vault:/vault

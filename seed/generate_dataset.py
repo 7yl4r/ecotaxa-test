@@ -125,6 +125,8 @@ TEMPLATE_HEADER = [
     "object_feret",
     "object_esd",
     "object_elongation",
+    "object_perimeter",
+    "object_circularity",
     "sample_id",
     "sample_project",
     "sample_ship",
@@ -159,6 +161,8 @@ TEMPLATE_TYPES = {
     "object_feret": "f",
     "object_esd": "f",
     "object_elongation": "f",
+    "object_perimeter": "f",
+    "object_circularity": "f",
     "sample_id": "t",
     "sample_project": "t",
     "sample_ship": "t",
@@ -207,6 +211,11 @@ def make_image(rng: random.Random, hue, aspect, size, jpg_path: Path):
     area = math.pi * (major / 2) * (minor / 2)
     esd = math.sqrt(4 * area / math.pi)
     feret = major
+    a, b = major / 2, minor / 2
+    # Ramanujan's ellipse perimeter approximation
+    h = ((a - b) / (a + b)) ** 2
+    perimeter = math.pi * (a + b) * (1 + 3 * h / (10 + math.sqrt(4 - 3 * h)))
+    circularity = 4 * math.pi * area / (perimeter**2)
     return {
         "width": canvas,
         "height": canvas,
@@ -217,6 +226,8 @@ def make_image(rng: random.Random, hue, aspect, size, jpg_path: Path):
         "feret": round(feret, 2),
         "esd": round(esd, 2),
         "elongation": round(major / minor, 3),
+        "perimeter": round(perimeter, 2),
+        "circularity": round(circularity, 4),
     }
 
 
@@ -280,6 +291,8 @@ def build():
                 "object_feret": morpho["feret"],
                 "object_esd": morpho["esd"],
                 "object_elongation": morpho["elongation"],
+                "object_perimeter": morpho["perimeter"],
+                "object_circularity": morpho["circularity"],
                 "sample_id": sample["sample_id"],
                 "sample_project": "ecotaxa-test seed data",
                 "sample_ship": sample["ship"],

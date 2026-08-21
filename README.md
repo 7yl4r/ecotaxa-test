@@ -7,24 +7,27 @@ example maintained by the EcoTaxa team.
 ## Services
 
 - **nginx** — reverse proxy in front of everything, exposed on `:8088`.
-- **ecotaxafront** ([ecotaxa_front](https://github.com/ecotaxa/ecotaxa_front)) — Angular UI, served via uwsgi.
-- **ecotaxaback** ([ecotaxa_back](https://github.com/ecotaxa/ecotaxa_back)) — FastAPI/Flask API, image vault, jobs.
-- **ecotaxagpuback** (optional, `--profile gpu`) — GPU-accelerated prediction/segmentation backend. Needs an NVIDIA GPU + NVIDIA Container Toolkit.
+- **ecotaxafront** ([ecotaxa_front](https://github.com/ecotaxa/ecotaxa_front)) — Angular/Flask UI, served via uwsgi.
+- **ecotaxaback** ([ecotaxa_back](https://github.com/ecotaxa/ecotaxa_back)) — FastAPI API, image vault, jobs.
+- **ecotaxagpuback** ([ecotaxa_ML_back](https://github.com/ecotaxa/ecotaxa_ML_back)) — ML back-end. Polls the shared job table directly and runs `Prediction` jobs (Random Forest training/classification, plus deep-CNN feature extraction if a GPU is available). Without deploying this, Prediction jobs sit pending forever — `ecotaxaback` deliberately excludes them from its own scheduler. Runs CPU-only here (no GPU on this host); only the "Add deep features" option in the Prediction wizard needs a real GPU.
 - **pgdb** — PostgreSQL 14 with pgvector, the application database.
 
-All service images are the official ones published by the EcoTaxa team on
-Docker Hub (`ecotaxa/ecotaxa_front`, `ecotaxa/ecotaxa_back`,
-`ecotaxa/ecotaxa_gpu_back`).
+`ecotaxaback`, `ecotaxafront`, and `ecotaxagpuback` are built from patched
+local source in `services/` rather than pulled from Docker Hub — see
+[Local patches](#local-patches-to-vendored-source) below.
 
 ## First run
 
 ```sh
+docker compose build
 ./setup.sh
 ```
 
-This starts postgres, creates the `ecotaxa` database, builds the schema, sets
-the administrator credentials, then brings up the full stack. It prints the
-admin login at the end.
+The build compiles all three app services from source (the ML back-end in
+particular is a slow, multi-GB build the first time — CUDA base image +
+TensorFlow). `setup.sh` then starts postgres, creates the `ecotaxa`
+database, builds the schema, sets the administrator credentials, and brings
+up the full stack. It prints the admin login at the end.
 
 Then open **http://localhost:8088**.
 
@@ -36,21 +39,17 @@ Then open **http://localhost:8088**.
 docker compose up -d
 ```
 
-## Optional: GPU back-end
-
-```sh
-docker compose --profile gpu up -d
-```
-
 ## Test dataset
 
 `seed/` generates a deterministic synthetic dataset (fixed random seed) and
 imports it into a project called **"Seed Test Dataset"**: 600 objects across
 3 sample stations and 26 real plankton taxa (pulled from EcoTaxoServer),
-~73% `validated` / ~27% `predicted`. Each object also gets 9 numeric
-"morphometric" columns (area, major/minor axis, elongation, ...) computed
-from its actual generated image, so there's real per-category signal to
-build train/test-split and model-evaluation UI against.
+~73% `validated` / ~27% `predicted`. Each object also gets 11 numeric
+"morphometric" columns (area, major/minor axis, elongation, perimeter,
+circularity, ...) computed from its actual generated image, so there's real
+per-category signal for the Prediction wizard's classifier to actually learn
+from — and enough free columns (≥10) for the project to show up as its own
+candidate source project in that wizard.
 
 ```sh
 ./seed.sh
@@ -77,6 +76,49 @@ developing the test/train split feature.
 To tweak the generated dataset (object count, category list, validated/predicted
 split), edit `seed/generate_dataset.py` — see `SEED_OBJECT_COUNT` and
 `SEED_VALIDATED_FRACTION` env vars, or the `CATEGORIES`/`SAMPLES` lists directly.
+
+## Prediction & train/test-split evaluation
+
+`/Job/Create/Prediction?projid=<id>` walks through: pick source project(s) →
+pick categories → pick features & settings → run. The "Choice of features
+and settings" step has a **"Held-out test %"** field (0–50%, default 0). When
+set, a stratified sample of that fraction of the learning set (per category)
+is held out, a classifier is trained on the rest, and its accuracy is
+measured against the held-out objects — reported per-taxon and overall on
+the job's monitor page — before the real classifier (always trained on the
+*full* learning set) classifies the target project's unclassified objects.
+Categories with fewer than 2 validated examples can't be evaluated (still
+used for training) and are called out separately in the result.
+
+This only exercises the classical Random-Forest path; "Add deep features"
+needs a real GPU running the ML back-end and isn't covered by the CPU-only
+setup here.
+
+## Local patches to vendored source
+
+`services/ecotaxa_back`, `services/ecotaxa_front`, `services/ecotaxa_ML_back`
+are patched clones of the upstream repos (not submodules — `.git` stripped).
+Patches so far: `test_fraction` added to the `PredictionReq` API model in
+both `ecotaxa_back` and `ecotaxa_ML_back`; the actual split/evaluate logic in
+`ecotaxa_ML_back`'s `API_operations/GPU_Prediction.py`; the wizard UI field
+and results table in `ecotaxa_front`'s `appli/jobs/by_type/Prediction.py` +
+`appli/templates/jobs/prediction_create_settings.html` + the hand-patched
+generated client `to_back/ecotaxa_cli_py/models/prediction_req.py`.
+
+`ecotaxaback`/`ecotaxafront`'s Dockerfiles expect their build context to be
+their own `docker/` folder with a `docker/py/` copy of the app source
+present (that's what upstream's `docker/build_prod.sh` does via `rsync`,
+normally driven off `git status`). Re-sync after further edits to those two
+services with:
+
+```sh
+cd services/ecotaxa_back/docker && rsync -avr --exclude-from=not_to_copy.lst ../py/ py/
+mkdir -p docker/prod_image && cp prod_image/start.sh docker/prod_image/
+cd services/ecotaxa_front/docker && rsync -avr --exclude=docker --exclude-from=not_to_copy.lst .. py/
+```
+
+then `docker compose build ecotaxaback ecotaxafront`. `ecotaxa_ML_back`
+doesn't need this — its Dockerfile builds straight from the repo root.
 
 ## Configuration
 
