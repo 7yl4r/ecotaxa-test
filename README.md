@@ -19,6 +19,9 @@ local source in `services/` rather than pulled from Docker Hub — see
 ## First run
 
 ```sh
+make build
+make setup
+# or, equivalently:
 docker compose build
 ./setup.sh
 ```
@@ -34,10 +37,34 @@ Then open **http://localhost:8088**.
 ## Subsequent runs
 
 ```sh
+make start
+# or
 ./start.sh
 # or
 docker compose up -d
 ```
+
+## Makefile
+
+| Target | Does | Data |
+| --- | --- | --- |
+| `make build` | `sync` + `docker compose build` (all three app services from source) | n/a |
+| `make sync` | Re-copies patched `services/ecotaxa_back` / `services/ecotaxa_front` source into the `docker/py/` copy their Dockerfiles actually build from — see [Local patches](#local-patches-to-vendored-source) | n/a |
+| `make setup` | First-time install: DB + schema + admin credentials + full stack (`./setup.sh`) | creates |
+| `make start` | Start/resume the already-installed stack, no rebuild (`./start.sh`) | preserved |
+| `make restart` | **Apply code changes, keep data.** `sync` + `docker compose build` + `docker compose up -d`, recreating only the containers whose image changed | preserved |
+| `make rebuild` | **Full rebuild, wipes data.** `docker compose down -v`, clears the bind-mounted data dirs, re-runs `setup` and `seed` from scratch (`./reset.sh`) | **wiped** |
+| `make seed` | (Re)generate and import the synthetic "Seed Test Dataset" project (`./seed.sh`) | modifies (that project only) |
+
+`make restart` is the one to reach for after editing any of the patched
+services (`services/ecotaxa_back`, `services/ecotaxa_front`,
+`services/ecotaxa_ML_back`) — it picks up the code change and recreates the
+affected container(s) in place, leaving `pgdata` and the bind-mounted
+`vault/`, `ftp_area/`, `file_srv/`, `models/`, `eco_users_files/` untouched.
+`make rebuild` is the "start over completely" button: it destroys the
+postgres volume and clears those same directories before reinstalling and
+reseeding, for when you want a guaranteed-clean instance rather than an
+incremental update.
 
 ## Test dataset
 
@@ -52,6 +79,8 @@ from — and enough free columns (≥10) for the project to show up as its own
 candidate source project in that wizard.
 
 ```sh
+make seed
+# or
 ./seed.sh
 ```
 
@@ -62,9 +91,23 @@ first (`./setup.sh`), and network access to `ecotaxoserver.obs-vlfr.fr` (the
 public EcoTaxa taxonomy server) the first time it pulls taxonomy — after
 that the pull is a fast no-op.
 
-### Full rebuild loop (for frontend iteration)
+### Restarting after code changes (keeps data)
 
 ```sh
+make restart
+```
+
+Re-syncs the patched `ecotaxa_back`/`ecotaxa_front` source, rebuilds any
+images whose code changed, and recreates just those containers with
+`docker compose up -d`. `pgdata` and the bind-mounted data dirs are left
+alone, so the admin account and "Seed Test Dataset" project survive. Use
+this after editing anything under `services/`.
+
+### Full rebuild loop (wipes data, for a guaranteed-clean instance)
+
+```sh
+make rebuild
+# or
 ./reset.sh
 ```
 
@@ -112,12 +155,15 @@ normally driven off `git status`). Re-sync after further edits to those two
 services with:
 
 ```sh
+make sync
+# or, equivalently:
 cd services/ecotaxa_back/docker && rsync -avr --exclude-from=not_to_copy.lst ../py/ py/
 mkdir -p docker/prod_image && cp prod_image/start.sh docker/prod_image/
 cd services/ecotaxa_front/docker && rsync -avr --exclude=docker --exclude-from=not_to_copy.lst .. py/
 ```
 
-then `docker compose build ecotaxaback ecotaxafront`. `ecotaxa_ML_back`
+then `docker compose build ecotaxaback ecotaxafront` (or just `make build` /
+`make restart`, which run `sync` first automatically). `ecotaxa_ML_back`
 doesn't need this — its Dockerfile builds straight from the repo root.
 
 ## Configuration
