@@ -2,7 +2,8 @@
 # This file is part of Ecotaxa, see license.md in the application root directory for license informations.
 # Copyright (C) 2015-2020  Picheral, Colin, Irisson (UPMC-CNRS)
 #
-from typing import List, Optional, Dict
+from datetime import datetime
+from typing import List, Optional, Dict, Any
 
 from BO.Training import PredictionInfoT
 from helpers.pydantic import BaseModel, Field
@@ -108,6 +109,28 @@ class PredictionInfoRsp(BaseModel):
         description="List of lists [object ID, category ID, score for category].",
         example=[[23456, 1234, 0.7], [23457, 768, 0.2]],
         default=[],
+    )
+
+
+class TrainingHistoryEntry(BaseModel):
+    """
+    One past, evaluated, training of a project's classifier -- i.e. one "version" of the
+    model, identified by when it happened. @see Training DB model, GPUPredictForProject.evaluate_split.
+    """
+
+    training_id: int = Field(
+        title="Training Id",
+        description="The training operation which produced this evaluation.",
+    )
+    training_start: datetime = Field(
+        title="Training start",
+        description="When this training/prediction job ran. Identifies the model version.",
+    )
+    evaluation: Dict[str, Any] = Field(
+        title="Evaluation",
+        description="Held-out test split evaluation for this training: test_fraction, "
+        "overall_accuracy, macro_accuracy, train_size, test_size, per_taxon, "
+        "excluded_categories.",
     )
 
 

@@ -89,6 +89,17 @@ class GPUPredictForProject(PredictForProject):
         training = TrainingBO.create_one(
             self.session, user.id, f"Prediction in {tgt_prj.projid}"
         )
+        # TrainingBO.create_one() doesn't set projid itself (it's a generic BO shared with
+        # other training-producing flows); do it here so this project's trainings can be
+        # found again, e.g. by /projects/{id}/training_history below.
+        training.training.projid = tgt_prj.projid
+        if evaluation is not None:
+            # Persist against this project's training history (@see /projects/{id}/training_history),
+            # independently of the job's own (transient) result, so accuracy can be tracked
+            # release-over-release. Committed now, ahead of classification, so it survives even
+            # if the classify step below fails partway.
+            training.training.evaluation = {**evaluation, "test_fraction": req.test_fraction}
+        self.session.commit()
 
         self.update_progress(20, "Training the classifier")
         classifier = self.build_classifier(np_feature_vals, classif_ids)

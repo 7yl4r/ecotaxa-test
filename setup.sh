@@ -30,6 +30,10 @@ sleep 5
 echo "==> Building the database schema..."
 docker exec -i ecotaxa_back bash -c "PYTHONPATH=. python cmds/manage.py db build"
 
+echo "==> Applying local schema patches..."
+docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
+  "ALTER TABLE training ADD COLUMN IF NOT EXISTS evaluation JSONB;"
+
 echo "==> Setting administrator credentials..."
 docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
   "UPDATE users SET email='${ADMIN_EMAIL}', password='${ADMIN_PASSWORD}' WHERE id=1;"

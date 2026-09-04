@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import cast, List
 
 from API_models.filters import ProjectFiltersDict
-from API_models.prediction import PredictionReq, PredictionRsp
+from API_models.prediction import PredictionReq, PredictionRsp, TrainingHistoryEntry
 from BO.Rights import RightsBO, Action
+from DB.Project import ProjectIDT
+from DB.Training import Training
 from DB.User import UserIDT
 from FS.MachineLearningModels import SavedModels
 from FS.Vault import Vault
@@ -79,3 +81,32 @@ class PredictionDataService(Service):
 
     def get_models(self) -> List[str]:
         return SavedModels(self.config).list()
+
+    # How many past evaluated trainings to hand back for a project's performance history/chart.
+    MAX_HISTORY = 50
+
+    def get_training_history(
+        self, current_user_id: UserIDT, project_id: ProjectIDT
+    ) -> List[TrainingHistoryEntry]:
+        """
+        Past, evaluated, trainings for a project, oldest first -- each one a "version" of
+        the project's classifier, identified by when it ran. @see GPUPredictForProject.evaluate_split
+        in ecotaxa_ML_back, which is what actually fills Training.evaluation.
+        """
+        RightsBO.user_wants(self.session, current_user_id, Action.READ, project_id)
+        rows = (
+            self.session.query(Training)
+            .filter(Training.projid == project_id)
+            .filter(Training.evaluation.isnot(None))
+            .order_by(Training.training_start.asc())
+            .limit(self.MAX_HISTORY)
+            .all()
+        )
+        return [
+            TrainingHistoryEntry(
+                training_id=row.training_id,
+                training_start=row.training_start,
+                evaluation=row.evaluation,
+            )
+            for row in rows
+        ]

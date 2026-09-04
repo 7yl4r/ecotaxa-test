@@ -1,0 +1,74 @@
+{% extends "layout.html" %}
+
+{% block body %}
+  {{ PreviousTxt|safe }}
+  <h3>PREDICTION: Held-out test evaluation</h3>
+  {{ filters_info|safe }}
+  <form class="form-horizontal" method="post">
+    <input type="hidden" name="src" value="{{ data.src }}">
+    <input type="hidden" name="Taxo" value="{{ data.taxo }}">
+    <input type="hidden" name="learninglimit" value="{{ data.learninglimit }}">
+    <input type="hidden" name="PostTaxoMapping" value="{{ data.pre_mapping }}">
+    <input type="hidden" name="CritVar" value="{{ data.features }}">
+    <input type="hidden" name="usescn" value="{{ data.usescn }}">
+    <input type="hidden" name="starttask" value="Y">
+    <input type="hidden" name="teststep" value="Y">
+
+    <div class="row">
+      <div class="panel panel-default col-md-8">
+        <p>
+          Before the classifier is used for real, you can set aside a percentage of the
+          Learning Set to check how accurate it actually is &mdash; per taxon and overall
+          &mdash; on data it wasn't trained on.
+        </p>
+        <li>
+          A stratified sample (i.e. the same percentage from each category) is held out,
+          a classifier is trained on the rest and tested against it; its accuracy is
+          reported below once the job finishes, and kept here as part of this project's
+          performance history.
+        </li>
+        <li>
+          The classifier actually deployed to classify your target project's objects is
+          always trained on the <b>full</b> Learning Set, regardless of this setting &mdash;
+          held-out evaluation only affects the reported numbers, never what gets trained
+          for real.
+        </li>
+        <li>
+          <b>0% is a valid choice</b>: nothing is held out, the full Learning Set is used to
+          train, and no accuracy is evaluated or recorded for this run.
+        </li>
+      </div>
+
+      <div class="col-md-4">
+        <p class="text-center">
+          <button type="submit" class="btn btn-primary">Start prediction task</button>
+        </p>
+        <div class="form-group row">
+          <div class="text-center">
+            <div>
+              <label for="testfraction" class="control-label" style="font-size:larger">Held-out test %</label>
+              <span data-container="body" data-toggle="tooltip"
+                    data-placement="right" data-html="true" title="
+<p style='text-align: left'>Set aside this percentage of the Learning Set, per category, to evaluate the
+classifier's accuracy before it's used. The classifier actually used to
+classify objects is still trained on the full Learning Set; this only
+affects the reported accuracy. 0 = no evaluation.</p>"
+                    class="glyphicon glyphicon-question-sign"></span>
+              <br>
+              <input type="number" name="testfraction" id="testfraction" min="0" max="50" step="5"
+                     value="{{ data.testfraction }}" style="width:5em">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    {% include "jobs/_training_history_chart.html" with context %}
+
+  </form>
+  <script>
+      $(function () {
+          $('[data-toggle="tooltip"]').tooltip()
+      })
+  </script>
+{% endblock %}

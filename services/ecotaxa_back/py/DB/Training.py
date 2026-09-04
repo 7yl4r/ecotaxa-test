@@ -8,11 +8,13 @@
 # Only exception to this rule is when predicted objects disappear.
 #
 from datetime import datetime
+from typing import Any, Optional
 
 from sqlalchemy.dialects.postgresql import (
     VARCHAR,
     INTEGER,
     TIMESTAMP,
+    JSONB,
 )
 
 from .Project import Project
@@ -40,6 +42,10 @@ class Training(Model):
     training_end: datetime = Column(TIMESTAMP, nullable=False)
     # The settings used?
     training_path: str = Column(VARCHAR(80), nullable=False)
+    # Held-out test split evaluation, when one was requested (@see PredictionReq.test_fraction).
+    # Shape: {test_fraction, overall_accuracy, macro_accuracy, train_size, test_size,
+    #         per_taxon: [...], excluded_categories: [...]}. Null when no split was evaluated.
+    evaluation: Optional[Any] = Column(JSONB, nullable=True)
 
     # The relationships are created in Relations.py but the typing here helps the IDE
     author: relationship

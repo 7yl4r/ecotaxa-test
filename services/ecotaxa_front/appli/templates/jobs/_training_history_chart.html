@@ -1,0 +1,91 @@
+{# Model performance history for a project's classifier: one point per evaluated training
+   (a Prediction job run with a held-out test % > 0), oldest first. `history` is a list of
+   dicts with training_id, training_start (ISO string) and evaluation (overall_accuracy,
+   macro_accuracy, ...). Included from both the "Held-out test %" wizard page and the
+   job monitor's finished-job panel, so a run's new point shows up in both places. #}
+{% set has_history = history and history|length > 0 %}
+<div style="margin: 1em 0; max-width: 700px;">
+  <h4>Model performance history</h4>
+  {% if has_history %}
+    <p><small>Accuracy of this project's classifier across its evaluated trainings (held-out
+      test %  &gt; 0). Each point is one training; hover for details.</small></p>
+    <div id="trnhist-{{ chart_id|default('main') }}"></div>
+    <script>
+      (function () {
+        if (typeof renderTrainingHistoryChart !== "function") {
+          window.renderTrainingHistoryChart = function (containerId, history) {
+            var el = document.getElementById(containerId);
+            if (!el || !history || history.length === 0) return;
+
+            var W = 640, H = 220, padL = 40, padR = 16, padT = 16, padB = 30;
+            var plotW = W - padL - padR, plotH = H - padT - padB;
+            var n = history.length;
+
+            function xAt(i) {
+              return n === 1 ? padL + plotW / 2 : padL + (plotW * i / (n - 1));
+            }
+            function yAt(pct) {
+              // pct in [0, 100]
+              return padT + plotH * (1 - pct / 100);
+            }
+            function fmtDate(iso) {
+              var d = new Date(iso);
+              return isNaN(d.getTime()) ? iso : d.toLocaleDateString();
+            }
+            function pathFor(key) {
+              var pts = [];
+              for (var i = 0; i < n; i++) {
+                var v = history[i].evaluation && history[i].evaluation[key];
+                if (v === null || v === undefined) continue;
+                pts.push(xAt(i) + "," + yAt(v * 100));
+              }
+              return pts.length > 1 ? "M" + pts.join(" L") : "";
+            }
+
+            var svg = [];
+            svg.push('<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H +
+              '" style="max-width:' + W + 'px" role="img" aria-label="Model accuracy over time">');
+            // Y gridlines/labels at 0/25/50/75/100%
+            [0, 25, 50, 75, 100].forEach(function (pct) {
+              var y = yAt(pct);
+              svg.push('<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y +
+                '" stroke="#e5e5e5" stroke-width="1"/>');
+              svg.push('<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="10" ' +
+                'text-anchor="end" fill="#666">' + pct + '%</text>');
+            });
+            // Lines: overall (solid blue), macro (dashed orange)
+            var overallPath = pathFor("overall_accuracy");
+            var macroPath = pathFor("macro_accuracy");
+            if (overallPath) {
+              svg.push('<path d="' + overallPath + '" fill="none" stroke="#337ab7" stroke-width="2"/>');
+            }
+            if (macroPath) {
+              svg.push('<path d="' + macroPath + '" fill="none" stroke="#f0ad4e" stroke-width="2" ' +
+                'stroke-dasharray="4,3"/>');
+            }
+            // Points + tooltips (native <title>) on the overall-accuracy line
+            for (var i = 0; i < n; i++) {
+              var ev = history[i].evaluation || {};
+              if (ev.overall_accuracy === null || ev.overall_accuracy === undefined) continue;
+              var cx = xAt(i), cy = yAt(ev.overall_accuracy * 100);
+              var label = fmtDate(history[i].training_start) +
+                "\nOverall: " + (ev.overall_accuracy * 100).toFixed(1) + "%" +
+                (ev.macro_accuracy != null ? "\nMacro-avg: " + (ev.macro_accuracy * 100).toFixed(1) + "%" : "") +
+                "\nTest size: " + (ev.test_size != null ? ev.test_size : "?");
+              svg.push('<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="#337ab7">' +
+                '<title>' + label.replace(/&/g, "&amp;").replace(/</g, "&lt;") + '</title></circle>');
+            }
+            svg.push("</svg>");
+            svg.push('<div><span style="color:#337ab7">&#9632;</span> Overall accuracy &nbsp; ' +
+              '<span style="color:#f0ad4e">&#9632;</span> Macro-average accuracy</div>');
+            el.innerHTML = svg.join("");
+          };
+        }
+        renderTrainingHistoryChart("trnhist-{{ chart_id|default('main') }}", {{ history|tojson }});
+      })();
+    </script>
+  {% else %}
+    <p><small>No evaluated training yet for this project &mdash; set a held-out test %
+      above and run a prediction to start tracking accuracy over time.</small></p>
+  {% endif %}
+</div>

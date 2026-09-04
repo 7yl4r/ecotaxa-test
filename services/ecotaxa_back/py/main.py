@@ -90,6 +90,7 @@ from API_models.prediction import (
     PredictionReq,
     MLModel,
     PredictionInfoRsp,
+    TrainingHistoryEntry,
 )
 from API_models.simsearch import SimilaritySearchRsp
 from API_models.subset import SubsetReq, SubsetRsp
@@ -2916,6 +2917,29 @@ def predict_object_set(
     """
     with PredictForProject(request, filters.base()) as sce:
         rsp = sce.run(current_user)
+    return rsp
+
+
+@app.get(
+    "/projects/{project_id}/training_history",
+    operation_id="get_training_history",
+    tags=["objects"],
+    response_model=List[TrainingHistoryEntry],
+)
+def get_training_history(
+    project_id: int,
+    current_user: int = Depends(get_current_user),
+) -> List[TrainingHistoryEntry]:
+    """
+    **Return the project's past evaluated trainings**, oldest first, i.e. the accuracy
+    history of its classifier across versions -- one entry per Prediction job which was
+    run with a held-out test fraction > 0.
+
+    🔒 Current user needs *at least Read* right on the project.
+    """
+    with PredictionDataService() as sce:
+        with RightsThrower():
+            rsp = sce.get_training_history(current_user, project_id)
     return rsp
 
 

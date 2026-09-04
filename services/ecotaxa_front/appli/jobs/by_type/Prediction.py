@@ -38,6 +38,9 @@ class PredictionJob(Job):
         elif gvp('starttask') != "Y":
             # Source chosen and categories but not features
             return cls.features_config_page()
+        elif gvp('teststep') != "Y":
+            # Features chosen but not the held-out test split
+            return cls.testsplit_config_page()
         else:
             errs = cls.validate_task()
             if len(errs) > 0:
@@ -191,6 +194,10 @@ class PredictionJob(Job):
         evaluation = result.get("evaluation")
         if evaluation:
             ret += cls.RenderEvaluation(evaluation)
+        with ApiClient(ProjectsApi, request) as api:
+            history = api.get_training_history(prj_id)
+        ret += render_template('jobs/_training_history_chart.html',
+                              history=history, chart_id="final")
         ret += """<a href='/prj/{0}' class='btn btn-primary btn-sm'  role=button>
         Go to Manual Classification Screen</a> """.format(prj_id)
         return ret
@@ -516,4 +523,32 @@ class PredictionJob(Job):
         g.critlist.sort(key=lambda t: t[0])
         return render_template('jobs/prediction_create_settings.html',
                                header="", data=hidden,
+                               filters_info=filters_html)
+
+    @classmethod
+    def testsplit_config_page(cls):
+        # Fourth page of the wizard: held-out test % + this project's model performance
+        # history, then the actual "start prediction task" submit.
+        target_prj, filters_html = cls.get_target_project()
+        if target_prj is None:
+            return PrintInCharte(filters_html)
+
+        prev_settings = DecodeEqualList(target_prj.classifsettings)
+        # Hidden FORM carrying forward the previous steps' choices, as posted by the
+        # features page's own form (@see prediction_create_settings.html)
+        hidden = {"src": gvp("src"),
+                  "taxo": gvp("Taxo"),
+                  "learninglimit": gvp("learninglimit"),
+                  "pre_mapping": gvp("PostTaxoMapping"),
+                  "features": gvp("CritVar"),
+                  "usescn": gvp("usescn"),
+                  "testfraction": prev_settings.get("testfraction", "0"),
+                  }
+
+        with ApiClient(ProjectsApi, request) as api:
+            history = api.get_training_history(target_prj.projid)
+
+        return render_template('jobs/prediction_create_testsplit.html',
+                               header="", data=hidden,
+                               history=history,
                                filters_info=filters_html)
