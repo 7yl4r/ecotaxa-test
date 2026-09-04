@@ -1,14 +1,17 @@
 {# Model performance history for a project's classifier: one point per evaluated training
-   (a Prediction job run with a held-out test % > 0), oldest first. `history` is a list of
+   (a Prediction job run with a held-out test % > 0), oldest first, plotted with the number
+   of validated images (train_size + test_size) on the X axis. `history` is a list of
    dicts with training_id, training_start (ISO string) and evaluation (overall_accuracy,
-   macro_accuracy, ...). Included from both the "Held-out test %" wizard page and the
-   job monitor's finished-job panel, so a run's new point shows up in both places. #}
+   macro_accuracy, train_size, test_size, ...). Included from both the "Held-out test %"
+   wizard page and the job monitor's finished-job panel, so a run's new point shows up in
+   both places. #}
 {% set has_history = history and history|length > 0 %}
 <div style="margin: 1em 0; max-width: 700px;">
   <h4>Model performance history</h4>
   {% if has_history %}
     <p><small>Accuracy of this project's classifier across its evaluated trainings (held-out
-      test %  &gt; 0). Each point is one training; hover for details.</small></p>
+      test %  &gt; 0), plotted against how many validated images the training set held at the
+      time. Each point is one training; hover for details.</small></p>
     <div id="trnhist-{{ chart_id|default('main') }}"></div>
     <script>
       (function () {
@@ -17,12 +20,24 @@
             var el = document.getElementById(containerId);
             if (!el || !history || history.length === 0) return;
 
-            var W = 640, H = 220, padL = 40, padR = 16, padT = 16, padB = 30;
+            var W = 640, H = 220, padL = 40, padR = 16, padT = 16, padB = 42;
             var plotW = W - padL - padR, plotH = H - padT - padB;
             var n = history.length;
 
+            // X axis = number of validated images backing the training (train_size + test_size),
+            // not training order, so points reflect how the learning set grew over time.
+            function validatedCount(i) {
+              var ev = history[i].evaluation || {};
+              return (ev.train_size || 0) + (ev.test_size || 0);
+            }
+            var xVals = [];
+            for (var i = 0; i < n; i++) xVals.push(validatedCount(i));
+            var xMin = Math.min.apply(null, xVals);
+            var xMax = Math.max.apply(null, xVals);
+            var xSpan = xMax - xMin;
+
             function xAt(i) {
-              return n === 1 ? padL + plotW / 2 : padL + (plotW * i / (n - 1));
+              return xSpan === 0 ? padL + plotW / 2 : padL + plotW * (xVals[i] - xMin) / xSpan;
             }
             function yAt(pct) {
               // pct in [0, 100]
@@ -44,7 +59,7 @@
 
             var svg = [];
             svg.push('<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H +
-              '" style="max-width:' + W + 'px" role="img" aria-label="Model accuracy over time">');
+              '" style="max-width:' + W + 'px" role="img" aria-label="Model accuracy vs. number of validated images">');
             // Y gridlines/labels at 0/25/50/75/100%
             [0, 25, 50, 75, 100].forEach(function (pct) {
               var y = yAt(pct);
@@ -53,6 +68,16 @@
               svg.push('<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="10" ' +
                 'text-anchor="end" fill="#666">' + pct + '%</text>');
             });
+            // X-axis labels: min and max validated image counts (plus the axis title)
+            var axisY = H - padB + 14;
+            svg.push('<text x="' + padL + '" y="' + axisY + '" font-size="10" ' +
+              'text-anchor="start" fill="#666">' + xMin + '</text>');
+            if (xSpan > 0) {
+              svg.push('<text x="' + (W - padR) + '" y="' + axisY + '" font-size="10" ' +
+                'text-anchor="end" fill="#666">' + xMax + '</text>');
+            }
+            svg.push('<text x="' + (padL + plotW / 2) + '" y="' + (axisY + 12) + '" font-size="10" ' +
+              'text-anchor="middle" fill="#666">Number of validated images</text>');
             // Lines: overall (solid blue), macro (dashed orange)
             var overallPath = pathFor("overall_accuracy");
             var macroPath = pathFor("macro_accuracy");
@@ -69,6 +94,7 @@
               if (ev.overall_accuracy === null || ev.overall_accuracy === undefined) continue;
               var cx = xAt(i), cy = yAt(ev.overall_accuracy * 100);
               var label = fmtDate(history[i].training_start) +
+                "\nValidated images: " + xVals[i] +
                 "\nOverall: " + (ev.overall_accuracy * 100).toFixed(1) + "%" +
                 (ev.macro_accuracy != null ? "\nMacro-avg: " + (ev.macro_accuracy * 100).toFixed(1) + "%" : "") +
                 "\nTest size: " + (ev.test_size != null ? ev.test_size : "?");
