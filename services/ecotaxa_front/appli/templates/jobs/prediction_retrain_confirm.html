@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+
+{% block body %}
+  <h3>PREDICTION: Re-train "{{ model_name }}"</h3>
+  {{ filters_info|safe }}
+
+  <div class="row">
+    <div class="panel panel-default col-md-8">
+      <p>Locked settings, reused as-is from this model's last training (version {{ model.version_count }},
+        trained {{ model.training_start }}):</p>
+      <ul>
+        <li>Source project(s): {{ model.config.source_project_ids|join(', ') }}</li>
+        <li>Categories: {{ model.config.categories|length }} selected</li>
+        <li>Features: {{ model.config.features|join(', ') }}</li>
+        <li>Learning limit per category: {{ model.config.learning_limit }}</li>
+        <li>Held-out test %: {{ (model.config.test_fraction * 100)|round|int }}%</li>
+        {% if model.config.use_scn %}<li>Deep features: enabled</li>{% endif %}
+      </ul>
+
+      {% if blocked_reason %}
+        <div class="alert alert-warning" role="alert">{{ blocked_reason }}</div>
+        <p><a href="?projid={{ projid }}" class="btn btn-default btn-sm">Back</a></p>
+      {% else %}
+        <form method="post">
+          <input type="hidden" name="mode" value="retrain">
+          <input type="hidden" name="modelname" value="{{ model_name }}">
+          <input type="hidden" name="confirmed" value="Y">
+          <p><button type="submit" class="btn btn-primary">Start re-training</button></p>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+
+  {% include "jobs/_training_history_chart.html" with context %}
+{% endblock %}

@@ -12,6 +12,7 @@ class PredictionReq:
     """
     def __init__(self, **kwargs):
         self.project_id: int = kwargs.get("project_id", 0)
+        self.model_name: str = kwargs.get("model_name", "")
         self.source_project_ids: List[int] = kwargs.get("source_project_ids", [])
         self.learning_limit: Optional[int] = kwargs.get("learning_limit")
         self.features: List[str] = kwargs.get("features", [])

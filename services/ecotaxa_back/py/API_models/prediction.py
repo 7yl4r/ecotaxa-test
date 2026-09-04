@@ -18,6 +18,14 @@ class PredictionReq(BaseModel):
         title="Project Id",
         description="The destination project, of which objects will be predicted.",
     )
+    model_name: str = Field(
+        title="Model name",
+        description="Identifies this classifier across retrainings. Must be unique "
+        "among this project's models when training a new one; when retraining, reuse "
+        "the existing name so this becomes another version of it.",
+        min_length=1,
+        max_length=120,
+    )
     source_project_ids: List[int] = Field(
         title="Source project Ids",
         description="The source projects, objects in them will serve as reference.",
@@ -126,11 +134,55 @@ class TrainingHistoryEntry(BaseModel):
         title="Training start",
         description="When this training/prediction job ran. Identifies the model version.",
     )
+    model_name: Optional[str] = Field(
+        title="Model name",
+        description="The named model this version belongs to, if any.",
+        default=None,
+    )
     evaluation: Dict[str, Any] = Field(
         title="Evaluation",
         description="Held-out test split evaluation for this training: test_fraction, "
         "overall_accuracy, macro_accuracy, train_size, test_size, per_taxon, "
         "excluded_categories.",
+    )
+
+
+class ModelSummary(BaseModel):
+    """
+    A named, possibly multi-version, classifier in a project: its locked recipe and its
+    latest version's info. @see Training.model_name/config/learning_set_size.
+    """
+
+    name: str = Field(
+        title="Name",
+        description="The model's name, as chosen when it was first trained.",
+    )
+    training_id: int = Field(
+        title="Latest training Id",
+        description="The most recent training operation for this model.",
+    )
+    training_start: datetime = Field(
+        title="Latest training start",
+        description="When the most recent version was trained.",
+    )
+    version_count: int = Field(
+        title="Version count",
+        description="How many times this model has been (re)trained.",
+    )
+    config: Dict[str, Any] = Field(
+        title="Config",
+        description="The locked recipe: source_project_ids, categories, features, "
+        "learning_limit, use_scn, pre_mapping, test_fraction.",
+    )
+    learning_set_size: Optional[int] = Field(
+        title="Learning set size",
+        description="Row count of the learning set at the latest version's training.",
+        default=None,
+    )
+    evaluation: Optional[Dict[str, Any]] = Field(
+        title="Latest evaluation",
+        description="Held-out test evaluation at the latest version, if one was run.",
+        default=None,
     )
 
 

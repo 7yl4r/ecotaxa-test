@@ -34,6 +34,7 @@ class PredictionReq(object):
     """
     openapi_types = {
         'project_id': 'int',
+        'model_name': 'str',
         'source_project_ids': 'list[int]',
         'learning_limit': 'int',
         'features': 'list[str]',
@@ -45,6 +46,7 @@ class PredictionReq(object):
 
     attribute_map = {
         'project_id': 'project_id',
+        'model_name': 'model_name',
         'source_project_ids': 'source_project_ids',
         'learning_limit': 'learning_limit',
         'features': 'features',
@@ -54,13 +56,14 @@ class PredictionReq(object):
         'test_fraction': 'test_fraction'
     }
 
-    def __init__(self, project_id=None, source_project_ids=None, learning_limit=None, features=None, categories=None, use_scn=False, pre_mapping=None, test_fraction=0.0, local_vars_configuration=None):  # noqa: E501
+    def __init__(self, project_id=None, model_name=None, source_project_ids=None, learning_limit=None, features=None, categories=None, use_scn=False, pre_mapping=None, test_fraction=0.0, local_vars_configuration=None):  # noqa: E501
         """PredictionReq - a model defined in OpenAPI"""  # noqa: E501
         if local_vars_configuration is None:
             local_vars_configuration = Configuration()
         self.local_vars_configuration = local_vars_configuration
 
         self._project_id = None
+        self._model_name = None
         self._source_project_ids = None
         self._learning_limit = None
         self._features = None
@@ -71,6 +74,7 @@ class PredictionReq(object):
         self.discriminator = None
 
         self.project_id = project_id
+        self.model_name = model_name
         self.source_project_ids = source_project_ids
         if learning_limit is not None:
             self.learning_limit = learning_limit
@@ -106,6 +110,31 @@ class PredictionReq(object):
             raise ValueError("Invalid value for `project_id`, must not be `None`")  # noqa: E501
 
         self._project_id = project_id
+
+    @property
+    def model_name(self):
+        """Gets the model_name of this PredictionReq.  # noqa: E501
+
+        Identifies this classifier across retrainings. Must be unique among this project's models when training a new one; when retraining, reuse the existing name so this becomes another version of it.  # noqa: E501
+
+        :return: The model_name of this PredictionReq.  # noqa: E501
+        :rtype: str
+        """
+        return self._model_name
+
+    @model_name.setter
+    def model_name(self, model_name):
+        """Sets the model_name of this PredictionReq.
+
+        Identifies this classifier across retrainings. Must be unique among this project's models when training a new one; when retraining, reuse the existing name so this becomes another version of it.  # noqa: E501
+
+        :param model_name: The model_name of this PredictionReq.  # noqa: E501
+        :type: str
+        """
+        if self.local_vars_configuration.client_side_validation and model_name is None:  # noqa: E501
+            raise ValueError("Invalid value for `model_name`, must not be `None`")  # noqa: E501
+
+        self._model_name = model_name
 
     @property
     def source_project_ids(self):

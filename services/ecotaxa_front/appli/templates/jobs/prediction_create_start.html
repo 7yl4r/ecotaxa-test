@@ -1,0 +1,54 @@
+{% extends "layout.html" %}
+
+{% block body %}
+  <h3>PREDICTION</h3>
+  {{ filters_info|safe }}
+
+  <div class="row">
+    <div class="col-md-12">
+      <p class="text-center">
+        <a href="?projid={{ projid }}&amp;mode=new" class="btn btn-primary">Train a new model</a>
+      </p>
+    </div>
+  </div>
+
+  {% if models %}
+    <h4>Or re-train an existing model</h4>
+    <p><small>Re-training reuses a model's exact settings (source projects, categories,
+      features, held-out test %) and only makes sense once more objects have been
+      validated since its last training &mdash; nothing here is editable.</small></p>
+    <div style="overflow-x:auto">
+      <table class="table table-striped table-condensed">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Last trained</th>
+            <th>Versions</th>
+            <th>Latest accuracy</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in models %}
+            <tr>
+              <td>{{ m.name }}</td>
+              <td>{{ m.training_start }}</td>
+              <td>{{ m.version_count }}</td>
+              <td>
+                {% if m.evaluation and m.evaluation.overall_accuracy is not none %}
+                  {{ "%.1f"|format(m.evaluation.overall_accuracy * 100) }}%
+                {% else %}
+                  <small>not evaluated</small>
+                {% endif %}
+              </td>
+              <td>
+                <a href="?projid={{ projid }}&amp;mode=retrain&amp;modelname={{ m.name|urlencode }}"
+                   class="btn btn-default btn-sm">Re-train</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}

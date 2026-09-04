@@ -91,6 +91,7 @@ from API_models.prediction import (
     MLModel,
     PredictionInfoRsp,
     TrainingHistoryEntry,
+    ModelSummary,
 )
 from API_models.simsearch import SimilaritySearchRsp
 from API_models.subset import SubsetReq, SubsetRsp
@@ -2928,18 +2929,43 @@ def predict_object_set(
 )
 def get_training_history(
     project_id: int,
+    model_name: Optional[str] = None,
     current_user: int = Depends(get_current_user),
 ) -> List[TrainingHistoryEntry]:
     """
     **Return the project's past evaluated trainings**, oldest first, i.e. the accuracy
     history of its classifier across versions -- one entry per Prediction job which was
-    run with a held-out test fraction > 0.
+    run with a held-out test fraction > 0. Pass `model_name` to restrict to one named
+    model's versions instead of every model in the project.
 
     🔒 Current user needs *at least Read* right on the project.
     """
     with PredictionDataService() as sce:
         with RightsThrower():
-            rsp = sce.get_training_history(current_user, project_id)
+            rsp = sce.get_training_history(current_user, project_id, model_name)
+    return rsp
+
+
+@app.get(
+    "/projects/{project_id}/models",
+    operation_id="get_trained_models",
+    tags=["objects"],
+    response_model=List[ModelSummary],
+)
+def get_trained_models(
+    project_id: int,
+    current_user: int = Depends(get_current_user),
+) -> List[ModelSummary]:
+    """
+    **Return the project's named models**, one summary per name (its locked recipe, latest
+    version's info, and version count) -- for the Prediction wizard's "train new" vs
+    "retrain existing" entry page.
+
+    🔒 Current user needs *at least Read* right on the project.
+    """
+    with PredictionDataService() as sce:
+        with RightsThrower():
+            rsp = sce.get_trained_models(current_user, project_id)
     return rsp
 
 

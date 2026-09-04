@@ -46,6 +46,17 @@ class Training(Model):
     # Shape: {test_fraction, overall_accuracy, macro_accuracy, train_size, test_size,
     #         per_taxon: [...], excluded_categories: [...]}. Null when no split was evaluated.
     evaluation: Optional[Any] = Column(JSONB, nullable=True)
+    # User-chosen name identifying this classifier across retrainings (Prediction jobs only;
+    # null for other training-producing flows, e.g. imports). Not unique at the DB level --
+    # several rows share a name, one per version -- uniqueness within a project is a UX-layer
+    # check, @see PredictionJob.validate_task in ecotaxa_front.
+    model_name: Optional[str] = Column(VARCHAR(120), nullable=True)
+    # The locked recipe used to produce this version, so a later retrain can replay it verbatim:
+    # {source_project_ids, categories, features, learning_limit, use_scn, pre_mapping, test_fraction}.
+    config: Optional[Any] = Column(JSONB, nullable=True)
+    # Row count of the learning set actually used at this training (independent of whether an
+    # evaluation split was done). Used to detect "more data validated since last training".
+    learning_set_size: Optional[int] = Column(INTEGER, nullable=True)
 
     # The relationships are created in Relations.py but the typing here helps the IDE
     author: relationship

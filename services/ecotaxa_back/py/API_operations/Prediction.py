@@ -10,10 +10,15 @@
 # Here is just the job registering part, the rest is in ecotaxa_ML_back project.
 #
 from pathlib import Path
-from typing import cast, List
+from typing import cast, List, Optional
 
 from API_models.filters import ProjectFiltersDict
-from API_models.prediction import PredictionReq, PredictionRsp, TrainingHistoryEntry
+from API_models.prediction import (
+    PredictionReq,
+    PredictionRsp,
+    TrainingHistoryEntry,
+    ModelSummary,
+)
 from BO.Rights import RightsBO, Action
 from DB.Project import ProjectIDT
 from DB.Training import Training
@@ -86,27 +91,66 @@ class PredictionDataService(Service):
     MAX_HISTORY = 50
 
     def get_training_history(
-        self, current_user_id: UserIDT, project_id: ProjectIDT
+        self,
+        current_user_id: UserIDT,
+        project_id: ProjectIDT,
+        model_name: Optional[str] = None,
     ) -> List[TrainingHistoryEntry]:
         """
         Past, evaluated, trainings for a project, oldest first -- each one a "version" of
         the project's classifier, identified by when it ran. @see GPUPredictForProject.evaluate_split
-        in ecotaxa_ML_back, which is what actually fills Training.evaluation.
+        in ecotaxa_ML_back, which is what actually fills Training.evaluation. When model_name
+        is given, restrict to that one named model's versions instead of the whole project.
+        """
+        RightsBO.user_wants(self.session, current_user_id, Action.READ, project_id)
+        qry = (
+            self.session.query(Training)
+            .filter(Training.projid == project_id)
+            .filter(Training.evaluation.isnot(None))
+        )
+        if model_name is not None:
+            qry = qry.filter(Training.model_name == model_name)
+        rows = qry.order_by(Training.training_start.asc()).limit(self.MAX_HISTORY).all()
+        return [
+            TrainingHistoryEntry(
+                training_id=row.training_id,
+                training_start=row.training_start,
+                model_name=row.model_name,
+                evaluation=row.evaluation,
+            )
+            for row in rows
+        ]
+
+    def get_trained_models(
+        self, current_user_id: UserIDT, project_id: ProjectIDT
+    ) -> List[ModelSummary]:
+        """
+        Named models trained for this project, one summary per name (latest version's info
+        + a version count), for the wizard's entry page (pick "train new" vs "retrain X").
         """
         RightsBO.user_wants(self.session, current_user_id, Action.READ, project_id)
         rows = (
             self.session.query(Training)
             .filter(Training.projid == project_id)
-            .filter(Training.evaluation.isnot(None))
+            .filter(Training.model_name.isnot(None))
             .order_by(Training.training_start.asc())
-            .limit(self.MAX_HISTORY)
             .all()
         )
+        # Small per-project scale: group in Python rather than a window-function query.
+        latest_by_name: dict = {}
+        count_by_name: dict = {}
+        for row in rows:
+            count_by_name[row.model_name] = count_by_name.get(row.model_name, 0) + 1
+            latest_by_name[row.model_name] = row  # rows are oldest->newest, last wins
         return [
-            TrainingHistoryEntry(
+            ModelSummary(
+                name=name,
                 training_id=row.training_id,
                 training_start=row.training_start,
+                version_count=count_by_name[name],
+                config=row.config or {},
+                learning_set_size=row.learning_set_size,
                 evaluation=row.evaluation,
             )
-            for row in rows
+            for name, row in sorted(latest_by_name.items())
         ]

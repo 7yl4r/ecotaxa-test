@@ -23,13 +23,34 @@ class PredictionJob(Job):
 
     @classmethod
     def initial_dialog(cls):
-        """ In UI/flask, initial load, GET """
+        """ In UI/flask, initial load, GET. Also the entry point for every retrain-flow
+        navigation link/GET (picking a model, viewing its confirm page) -- only the final
+        "start re-training" submit is a POST, handled in create_or_update below. """
+        mode = gvg('mode')
+        if mode == 'retrain':
+            model_name = gvg('modelname', '')
+            if model_name == '':
+                return cls.workflow_start_page()
+            return cls.retrain_confirm_page(model_name)
+        if mode != 'new':
+            with ApiClient(ProjectsApi, request) as api:
+                models = api.get_trained_models(int(gvg("projid")))
+            if models:
+                # Existing named model(s): let the user choose train-new vs retrain-one,
+                # instead of dropping them straight into "train new" as if this were the
+                # project's first model.
+                return cls.workflow_start_page()
         return cls.base_projects_select_page()
 
     @classmethod
     def create_or_update(cls):
         """ In UI/flask, submit/resubmit of pages """
-        if gvp('src', gvg('src')) == "":
+        if gvp('mode') == 'retrain':
+            # The only POST in the retrain sub-flow: the confirm page's "start re-training"
+            # submit. Everything before this (picking a model, viewing the confirm page) is
+            # plain GET navigation handled by initial_dialog above.
+            return cls.retrain_start_task()
+        elif gvp('src', gvg('src')) == "":
             # Source not chosen yet
             return cls.base_projects_select_page()
         elif gvp('learninglimit', gvg('learninglimit')) == "":
@@ -185,6 +206,7 @@ class PredictionJob(Job):
     @classmethod
     def final_action(cls, job: JobModel):
         prj_id = job.params["req"]["project_id"]
+        model_name = job.params["req"].get("model_name")  # absent on jobs predating naming
         time.sleep(1)
         # TODO: Remove the commented, but for now we have trace information inside
         # DoTaskClean(self.task.id)
@@ -194,8 +216,10 @@ class PredictionJob(Job):
         evaluation = result.get("evaluation")
         if evaluation:
             ret += cls.RenderEvaluation(evaluation)
+        # Scoped to this job's own model, not every model in the project, so the chart
+        # reads as "this model's versions".
         with ApiClient(ProjectsApi, request) as api:
-            history = api.get_training_history(prj_id)
+            history = api.get_training_history(prj_id, model_name=model_name)
         ret += render_template('jobs/_training_history_chart.html',
                               history=history, chart_id="final")
         ret += """<a href='/prj/{0}' class='btn btn-primary btn-sm'  role=button>
@@ -254,7 +278,7 @@ class PredictionJob(Job):
     def validate_task(cls):
         target_prj, filters_html = cls.get_target_project()
 
-        src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction = \
+        src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction, model_name = \
             cls.get_posted_task_params()
 
         # Check a bit
@@ -263,6 +287,15 @@ class PredictionJob(Job):
             errors.append("You must select some variable")
         if len(categories) == 0:
             errors.append("You must select some category")
+        if model_name == "":
+            errors.append("You must name this model")
+        else:
+            with ApiClient(ProjectsApi, request) as api:
+                existing_models = api.get_trained_models(target_prj.projid)
+            if any(m["name"] == model_name for m in existing_models):
+                errors.append(
+                    "Model name '%s' is already used in this project -- pick another, "
+                    "or use Re-train instead" % model_name)
 
         # Use the API entry point for querying the impacted objects. At this point we just need
         # to know if it's != 0
@@ -301,11 +334,12 @@ class PredictionJob(Job):
         filters = {}
         cls._extract_filters_from_url(filters, target_prj)
 
-        src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction = \
+        src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction, model_name = \
             cls.get_posted_task_params()
 
         # Prepare back-end call
         req = PredictionReq(project_id=target_prj.projid,
+                            model_name=model_name,
                             source_project_ids=src_prj_ids,
                             learning_limit=learning_limit,
                             categories=categories,
@@ -342,7 +376,8 @@ class PredictionJob(Job):
         pre_mapping = {int(from_): int(to) for from_, to in pre_map_txt}
         # Posted as a 0-50 percentage, PredictionReq wants a 0.0-0.5 fraction
         test_fraction = int(gvp("testfraction", "0") or "0") / 100.0
-        return src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction
+        model_name = gvp("modelname", "").strip()
+        return src_prj_ids, categories, learning_limit, pre_mapping, obj_vars, use_scn, test_fraction, model_name
 
     @staticmethod
     def api_read_accessible_projects(instrument_filter, title_filter):
@@ -527,8 +562,8 @@ class PredictionJob(Job):
 
     @classmethod
     def testsplit_config_page(cls):
-        # Fourth page of the wizard: held-out test % + this project's model performance
-        # history, then the actual "start prediction task" submit.
+        # Fourth (final) page of the "train new model" wizard: name the model + held-out
+        # test %, then the actual "start prediction task" submit.
         target_prj, filters_html = cls.get_target_project()
         if target_prj is None:
             return PrintInCharte(filters_html)
@@ -543,12 +578,118 @@ class PredictionJob(Job):
                   "features": gvp("CritVar"),
                   "usescn": gvp("usescn"),
                   "testfraction": prev_settings.get("testfraction", "0"),
+                  "modelname": gvp("modelname", ""),
                   }
-
-        with ApiClient(ProjectsApi, request) as api:
-            history = api.get_training_history(target_prj.projid)
 
         return render_template('jobs/prediction_create_testsplit.html',
                                header="", data=hidden,
-                               history=history,
                                filters_info=filters_html)
+
+    #################################################################################################
+    # "Re-train an existing model" sub-flow. Everything in the recipe (source projects,
+    # categories, features, learning limit, held-out test %) is locked to the named model's
+    # last training -- nothing here is re-asked or editable, only the current amount of
+    # validated data is re-checked. @see plan doc for why: comparability across a model's
+    # versions, and "retrain" is meant to be a one-click action once more data exists.
+
+    @classmethod
+    def workflow_start_page(cls):
+        # Entry page when the project already has named model(s): choose "train a new
+        # model" (today's wizard, unchanged) or "re-train" one of the listed ones.
+        target_prj, filters_html = cls.get_target_project()
+        if target_prj is None:
+            return PrintInCharte(filters_html)
+        with ApiClient(ProjectsApi, request) as api:
+            models = api.get_trained_models(target_prj.projid)
+        return render_template('jobs/prediction_create_start.html',
+                               filters_info=filters_html,
+                               projid=target_prj.projid,
+                               models=models)
+
+    @classmethod
+    def _find_model(cls, target_prj: ProjectModel, model_name: str) -> Optional[dict]:
+        with ApiClient(ProjectsApi, request) as api:
+            models = api.get_trained_models(target_prj.projid)
+        return next((m for m in models if m["name"] == model_name), None)
+
+    @classmethod
+    def _retrain_blocker(cls, target_prj: ProjectModel, model: dict) -> Optional[str]:
+        """ None if a retrain can proceed, else an explanatory message. """
+        config = model["config"]
+        # 1. Has more been validated (in the locked source projects/categories) since the
+        # model's last training? Reuses the same stats call categories_config_page() uses.
+        src_ids_str = ",".join(str(x) for x in config["source_project_ids"])
+        with ApiClient(ProjectsApi, request) as api:
+            stats: List[ProjectTaxoStatsModel] = api.project_set_get_stats(ids=src_ids_str, taxa_ids="all")
+        categories = set(config["categories"])
+        current_validated = sum(
+            a_stat.nb_validated for a_stat in stats
+            if a_stat.used_taxa and a_stat.used_taxa[0] in categories and a_stat.nb_validated
+        )
+        last_size = model.get("learning_set_size") or 0
+        if current_validated <= last_size:
+            return ("No new validated objects since this model's last training on {0} "
+                    "(still {1} validated, matching its source projects/categories). "
+                    "Validate more objects before re-training.").format(
+                model.get("training_start", "?"), current_validated)
+        # 2. Are there objects to actually classify right now?
+        filters: Dict[str, str] = {}
+        cls._extract_filters_from_url(filters, target_prj)
+        filters["statusfilter"] = "UP"
+        with ApiClient(ObjectsApi, request) as api:
+            res: ObjectSetQueryRsp = api.get_object_set(
+                project_id=target_prj.projid, project_filters=filters, window_size=100)
+        if len(res.object_ids) == 0:
+            return cls.cook_no_object_message(filters)
+        return None
+
+    @classmethod
+    def retrain_confirm_page(cls, model_name: str):
+        target_prj, filters_html = cls.get_target_project()
+        if target_prj is None:
+            return PrintInCharte(filters_html)
+        model = cls._find_model(target_prj, model_name)
+        if model is None:
+            flash("Model '%s' not found in this project" % model_name, "error")
+            return cls.workflow_start_page()
+        blocked_reason = cls._retrain_blocker(target_prj, model)
+        with ApiClient(ProjectsApi, request) as api:
+            history = api.get_training_history(target_prj.projid, model_name=model_name)
+        return render_template('jobs/prediction_retrain_confirm.html',
+                               filters_info=filters_html,
+                               projid=target_prj.projid,
+                               model_name=model_name, model=model,
+                               blocked_reason=blocked_reason, history=history)
+
+    @classmethod
+    def retrain_start_task(cls):
+        model_name = gvp("modelname", "")
+        target_prj, filters_html = cls.get_target_project()
+        if target_prj is None:
+            return PrintInCharte(filters_html)
+        model = cls._find_model(target_prj, model_name)
+        if model is None:
+            flash("Model '%s' not found in this project" % model_name, "error")
+            return cls.workflow_start_page()
+        # Re-check server-side rather than trust the confirm page's rendering.
+        blocked_reason = cls._retrain_blocker(target_prj, model)
+        if blocked_reason:
+            flash(blocked_reason, "error")
+            return cls.retrain_confirm_page(model_name)
+
+        config = model["config"]
+        filters: Dict[str, str] = {}
+        cls._extract_filters_from_url(filters, target_prj)
+        req = PredictionReq(project_id=target_prj.projid,
+                            model_name=model_name,
+                            source_project_ids=config["source_project_ids"],
+                            learning_limit=config["learning_limit"],
+                            categories=config["categories"],
+                            features=config["features"],
+                            use_scn=config["use_scn"],
+                            pre_mapping=config["pre_mapping"],
+                            test_fraction=config["test_fraction"])
+        with ApiClient(ObjectsApi, request) as api:
+            rsp: PredictionRsp = api.predict_object_set({'filters': filters,
+                                                         'request': req})
+        return redirect("/Job/Monitor/%d" % rsp.job_id)

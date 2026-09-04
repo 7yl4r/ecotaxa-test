@@ -93,6 +93,20 @@ class GPUPredictForProject(PredictForProject):
         # other training-producing flows); do it here so this project's trainings can be
         # found again, e.g. by /projects/{id}/training_history below.
         training.training.projid = tgt_prj.projid
+        training.training.model_name = req.model_name
+        # The locked recipe, so a later retrain (@see PredictionJob.retrain_start_task in
+        # ecotaxa_front) can replay this version verbatim, and so /projects/{id}/models can
+        # summarize it. Store what was *requested*, not the post-filtering `used_features`.
+        training.training.config = {
+            "source_project_ids": req.source_project_ids,
+            "categories": req.categories,
+            "features": req.features,
+            "learning_limit": req.learning_limit,
+            "use_scn": req.use_scn,
+            "pre_mapping": req.pre_mapping,
+            "test_fraction": req.test_fraction,
+        }
+        training.training.learning_set_size = ls_size
         if evaluation is not None:
             # Persist against this project's training history (@see /projects/{id}/training_history),
             # independently of the job's own (transient) result, so accuracy can be tracked

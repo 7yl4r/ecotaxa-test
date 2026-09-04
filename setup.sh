@@ -32,7 +32,11 @@ docker exec -i ecotaxa_back bash -c "PYTHONPATH=. python cmds/manage.py db build
 
 echo "==> Applying local schema patches..."
 docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
-  "ALTER TABLE training ADD COLUMN IF NOT EXISTS evaluation JSONB;"
+  "ALTER TABLE training
+     ADD COLUMN IF NOT EXISTS evaluation JSONB,
+     ADD COLUMN IF NOT EXISTS model_name VARCHAR(120),
+     ADD COLUMN IF NOT EXISTS config JSONB,
+     ADD COLUMN IF NOT EXISTS learning_set_size INTEGER;"
 
 echo "==> Setting administrator credentials..."
 docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \

@@ -2,7 +2,7 @@
 
 {% block body %}
   {{ PreviousTxt|safe }}
-  <h3>PREDICTION: Held-out test evaluation</h3>
+  <h3>PREDICTION: Name this model &amp; held-out test evaluation</h3>
   {{ filters_info|safe }}
   <form class="form-horizontal" method="post">
     <input type="hidden" name="src" value="{{ data.src }}">
@@ -17,14 +17,20 @@
     <div class="row">
       <div class="panel panel-default col-md-8">
         <p>
-          Before the classifier is used for real, you can set aside a percentage of the
-          Learning Set to check how accurate it actually is &mdash; per taxon and overall
-          &mdash; on data it wasn't trained on.
+          Name this model so you can find it and <b>re-train</b> it later (same source
+          projects, categories, features and held-out test % as now, replayed later once
+          more objects are validated) instead of starting from scratch. Must be unique
+          in this project.
+        </p>
+        <p>
+          Before the classifier is used for real, you can also set aside a percentage of
+          the Learning Set to check how accurate it actually is &mdash; per taxon and
+          overall &mdash; on data it wasn't trained on.
         </p>
         <li>
           A stratified sample (i.e. the same percentage from each category) is held out,
           a classifier is trained on the rest and tested against it; its accuracy is
-          reported below once the job finishes, and kept here as part of this project's
+          reported below once the job finishes, and kept as part of this model's
           performance history.
         </li>
         <li>
@@ -46,6 +52,21 @@
         <div class="form-group row">
           <div class="text-center">
             <div>
+              <label for="modelname" class="control-label" style="font-size:larger">Model name</label>
+              <span data-container="body" data-toggle="tooltip"
+                    data-placement="right" data-html="true" title="
+<p style='text-align: left'>Identifies this classifier so you can retrain it later. Must be unique
+among this project's models.</p>"
+                    class="glyphicon glyphicon-question-sign"></span>
+              <br>
+              <input type="text" name="modelname" id="modelname" required maxlength="120"
+                     value="{{ data.modelname }}" style="width:14em">
+            </div>
+          </div>
+        </div>
+        <div class="form-group row">
+          <div class="text-center">
+            <div>
               <label for="testfraction" class="control-label" style="font-size:larger">Held-out test %</label>
               <span data-container="body" data-toggle="tooltip"
                     data-placement="right" data-html="true" title="
@@ -62,8 +83,6 @@ affects the reported accuracy. 0 = no evaluation.</p>"
         </div>
       </div>
     </div>
-
-    {% include "jobs/_training_history_chart.html" with context %}
 
   </form>
   <script>
