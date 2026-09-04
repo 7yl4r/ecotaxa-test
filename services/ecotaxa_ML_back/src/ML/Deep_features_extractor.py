@@ -22,9 +22,10 @@ from FS.MachineLearningModels import SavedModels
 from FS.Vault import Vault
 from helpers.DynamicLogs import get_logger
 from .Base_ML import MachineLearningBase
-from .helpers import generator  # type: ignore # custom data generator
-# Import the library, only after having tweaked it
-from .helpers.tensorflow_cfg import configured_tf  # type: ignore
+# NB: generator/tensorflow_cfg both import TensorFlow, which needs AVX and so
+# is unusable on some (older) CPUs. Deferred to the methods that actually
+# need them so a host without deep-features support can still run the
+# classical Random-Forest path -- see ML_back/README or ecotaxa-test/README.md.
 
 logger = get_logger(__name__)
 
@@ -67,6 +68,8 @@ class DeepFeaturesExtractor(MachineLearningBase):
         """
         Predict what's in in_df and return the result dataframe.
         """
+        from .helpers import generator  # type: ignore # custom data generator
+
         # prepare data batches
         batches = generator.EcoTaxaGenerator(
             images_paths=self.full_img_paths(in_df.img_path.values),
@@ -93,6 +96,9 @@ class DeepFeaturesExtractor(MachineLearningBase):
         """
         Load saved model and PCA params, for the given model.
         """
+        # Import the library, only after having tweaked it
+        from .helpers.tensorflow_cfg import configured_tf  # type: ignore
+
         my_fe = configured_tf.keras.models.load_model(
             self.model_dir.extractor_path(model_name)
         )
