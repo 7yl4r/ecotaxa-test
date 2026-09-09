@@ -276,7 +276,8 @@ class PredictionJob(Job):
             train_size=evaluation.get("train_size", 0),
             rows=rows,
             excluded_note=excluded_note,
-            chart=cls.RenderPerTaxonBarChart(sorted_taxon),
+            chart=cls.RenderPerTaxonBarChart(sorted_taxon)
+            + cls.RenderConfusionMatrix(evaluation.get("confusion_matrix") or {}, sorted_taxon),
         )
 
     @classmethod
@@ -315,6 +316,93 @@ class PredictionJob(Job):
           <div style="display:flex; flex-direction:column; gap:2px;">{bar_rows}</div>
         </div>
         """.format(bar_rows=bar_rows)
+
+    @classmethod
+    def RenderConfusionMatrix(cls, confusion: dict, sorted_taxon: List[dict]) -> str:
+        """
+        Actual-taxon x predicted-taxon grid: cell = how many of that row's held-out
+        test objects were predicted as that column's taxon. One sequential hue,
+        shaded by row (i.e. recall-normalized) share, so a taxon's confusions are
+        readable in isolation regardless of how much support it has. Rows follow
+        the same worst-accuracy-first order as the table/bar chart above; columns
+        share that order (numbered, since full names don't fit as headers).
+        """
+        labels = confusion.get("labels") or []
+        matrix = confusion.get("matrix") or []
+        if not labels or not matrix:
+            return ""
+
+        id_to_idx = {lbl["classif_id"]: i for i, lbl in enumerate(labels)}
+        # Same order as the table/chart above, then any predicted-only extras
+        # (a taxon that was never actually a test object but got guessed anyway).
+        order_ids = [r["classif_id"] for r in sorted_taxon if r["classif_id"] in id_to_idx]
+        order_ids += [lbl["classif_id"] for lbl in labels if lbl["classif_id"] not in set(order_ids)]
+        order = [id_to_idx[tid] for tid in order_ids]
+        name_of = {lbl["classif_id"]: lbl["name"] for lbl in labels}
+        n = len(order)
+
+        header_cells = "".join(
+            '<th style="font-size:11px; text-align:center; padding:3px 5px; '
+            'font-weight:normal; color:#666;" title="{name}">{num}</th>'.format(
+                name=XSSEscape(name_of[order_ids[j]]), num=j + 1
+            )
+            for j in range(n)
+        )
+
+        body_rows = []
+        for i in range(n):
+            ri = order[i]
+            row_total = sum(matrix[ri][order[j]] for j in range(n)) or 1
+            cells = []
+            for j in range(n):
+                count = matrix[ri][order[j]]
+                pct = count / row_total * 100
+                bg = ""
+                if count:
+                    alpha = 0.08 + 0.85 * (pct / 100.0)
+                    bg = "background:rgba(51,122,183,{0:.3f});".format(alpha)
+                diag = "box-shadow:inset 0 0 0 2px #337ab7;" if i == j else ""
+                cells.append(
+                    '<td style="text-align:center; font-size:11px; padding:3px 5px; '
+                    'min-width:24px; {bg} {diag}" '
+                    'title="Actual {actual} -&gt; predicted {predicted}: {count} ({pct:.0f}%)">'
+                    '{display}</td>'.format(
+                        bg=bg, diag=diag,
+                        actual=XSSEscape(name_of[order_ids[i]]),
+                        predicted=XSSEscape(name_of[order_ids[j]]),
+                        count=count, pct=pct,
+                        display=count if count else "",
+                    )
+                )
+            body_rows.append(
+                '<tr><th style="font-size:12px; font-weight:normal; text-align:right; '
+                'white-space:nowrap; padding-right:6px; max-width:180px; overflow:hidden; '
+                'text-overflow:ellipsis;" title="{name}">{num}. {name}</th>{cells}</tr>'.format(
+                    name=XSSEscape(name_of[order_ids[i]]), num=i + 1, cells="".join(cells)
+                )
+            )
+
+        return """
+        <div style="margin-top:1.5em; max-width:100%;">
+          <h4>Confusion matrix</h4>
+          <p><small>Rows = actual taxon, columns = predicted taxon, same order (numbered --
+            columns don't fit full names). Darker = a larger share of that row's held-out
+            test objects landed there; the outlined diagonal is where actual matches
+            predicted. Hover a cell for the exact count and percentage.</small></p>
+          <div style="overflow-x:auto; max-width:100%;">
+            <table style="border-collapse:collapse;">
+              <thead><tr><th></th>{header}</tr></thead>
+              <tbody>{rows}</tbody>
+            </table>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px; margin-top:6px; max-width:220px;">
+            <span style="font-size:11px; color:#666;">0%</span>
+            <div style="flex:1; height:10px; border-radius:2px;
+                        background:linear-gradient(to right, rgba(51,122,183,0.08), rgba(51,122,183,0.93));"></div>
+            <span style="font-size:11px; color:#666;">100% of row</span>
+          </div>
+        </div>
+        """.format(header=header_cells, rows="".join(body_rows))
 
     #################################################################################################
 

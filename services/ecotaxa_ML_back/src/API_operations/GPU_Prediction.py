@@ -191,11 +191,15 @@ class GPUPredictForProject(PredictForProject):
             if true_id == pred_id:
                 entry["correct"] += 1
 
+        # Names for every taxon involved as either an actual or a predicted label in
+        # the test set -- a superset of per_taxon_counts.keys(), since a category can
+        # be (wrongly) predicted without ever being the true label of a test object.
+        all_label_ids = sorted(set(per_taxon_counts.keys()) | set(pred_y.tolist()))
         names: Dict[int, str] = {}
-        if per_taxon_counts:
+        if all_label_ids:
             rows = (
                 self.ro_session.query(Taxonomy)
-                .filter(Taxonomy.id.in_(list(per_taxon_counts.keys())))
+                .filter(Taxonomy.id.in_(all_label_ids))
                 .all()
             )
             names = {row.id: (row.display_name or row.name) for row in rows}
@@ -214,6 +218,27 @@ class GPUPredictForProject(PredictForProject):
                 }
             )
         per_taxon.sort(key=lambda r: -r["support"])
+
+        # Full confusion matrix: rows/columns share one label order (per_taxon's,
+        # most-tested first, then any predicted-only categories) so the UI can
+        # show, for each actual taxon, exactly which taxa its misclassifications
+        # landed on.
+        confusion_label_ids = [r["classif_id"] for r in per_taxon]
+        confusion_label_ids += sorted(
+            set(pred_y.tolist()) - set(confusion_label_ids)
+        )
+        label_index = {taxon_id: i for i, taxon_id in enumerate(confusion_label_ids)}
+        n_labels = len(confusion_label_ids)
+        conf_matrix = [[0] * n_labels for _ in range(n_labels)]
+        for true_id, pred_id in zip(test_y.tolist(), pred_y.tolist()):
+            conf_matrix[label_index[true_id]][label_index[pred_id]] += 1
+        confusion_matrix = {
+            "labels": [
+                {"classif_id": int(taxon_id), "name": names.get(taxon_id, str(taxon_id))}
+                for taxon_id in confusion_label_ids
+            ],
+            "matrix": conf_matrix,
+        }
 
         total_support = len(test_y)
         total_correct = int((pred_y == test_y).sum())
@@ -234,6 +259,7 @@ class GPUPredictForProject(PredictForProject):
             "train_size": int(len(train_y)),
             "test_size": int(total_support),
             "per_taxon": per_taxon,
+            "confusion_matrix": confusion_matrix,
             "excluded_categories": excluded,
         }
 
