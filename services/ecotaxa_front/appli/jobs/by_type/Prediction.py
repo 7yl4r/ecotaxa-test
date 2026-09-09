@@ -238,11 +238,16 @@ class PredictionJob(Job):
             msg = note or "Not enough data to evaluate."
             return "<p><b>Evaluation:</b> {0}</p>".format(XSSEscape(msg))
 
+        # Worst accuracy first: the table and the bar chart below share this
+        # order, so problem categories are the first thing you see in both.
+        sorted_taxon = sorted(per_taxon, key=lambda r: r["accuracy"])
+
         rows = "".join(
-            """<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3:.1f}%</td></tr>""".format(
-                XSSEscape(r["name"]), r["support"], r["correct"], r["accuracy"] * 100
+            """<tr><td>{0}</td><td>{1}</td><td>{2} / {3}</td><td>{4:.1f}%</td></tr>""".format(
+                XSSEscape(r["name"]), r.get("train_support", 0), r["correct"],
+                r["support"], r["accuracy"] * 100
             )
-            for r in per_taxon
+            for r in sorted_taxon
         )
         excluded_note = ""
         if excluded:
@@ -258,10 +263,11 @@ class PredictionJob(Job):
           <p><b>Overall accuracy: {overall:.1f}%</b> &nbsp; (macro-average: {macro:.1f}%,
           test size: {test_size}, train size: {train_size})</p>
           <table class="table table-striped table-condensed" style="max-width:600px">
-            <thead><tr><th>Taxon</th><th>Support</th><th>Correct</th><th>Accuracy</th></tr></thead>
+            <thead><tr><th>Taxon</th><th>Train images</th><th>Correct / Support</th><th>Accuracy</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
           {excluded_note}
+          {chart}
         </div>
         """.format(
             overall=(overall or 0) * 100,
@@ -270,7 +276,45 @@ class PredictionJob(Job):
             train_size=evaluation.get("train_size", 0),
             rows=rows,
             excluded_note=excluded_note,
+            chart=cls.RenderPerTaxonBarChart(sorted_taxon),
         )
+
+    @classmethod
+    def RenderPerTaxonBarChart(cls, sorted_taxon: List[dict]) -> str:
+        """
+        Horizontal bar chart of per-taxon accuracy, one hue (this is a single
+        magnitude series, not distinct categories), worst first -- same order
+        as the table above it. `sorted_taxon` is already sorted by accuracy.
+        """
+        bar_rows = "".join(
+            """
+            <div style="display:flex; align-items:center; gap:8px; height:22px;"
+                 title="{name_attr}: {correct}/{support} correct in test, {train} image(s) in training set">
+              <div style="width:180px; flex:0 0 180px; font-size:12px; text-align:right;
+                          white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{name}</div>
+              <div style="position:relative; flex:1 1 auto; height:16px;">
+                <div style="position:absolute; left:0; top:0; bottom:0; width:{pct:.2f}%;
+                            min-width:2px; background:#337ab7; border-radius:0 4px 4px 0;"></div>
+              </div>
+              <div style="width:46px; flex:0 0 46px; font-size:12px;
+                          font-variant-numeric:tabular-nums;">{pct:.1f}%</div>
+            </div>
+            """.format(
+                name_attr=XSSEscape(r["name"]),
+                name=XSSEscape(r["name"]),
+                correct=r["correct"],
+                support=r["support"],
+                train=r.get("train_support", 0),
+                pct=r["accuracy"] * 100,
+            )
+            for r in sorted_taxon
+        )
+        return """
+        <div style="margin-top:1.5em; max-width:700px;">
+          <h4>Accuracy by taxon</h4>
+          <div style="display:flex; flex-direction:column; gap:2px;">{bar_rows}</div>
+        </div>
+        """.format(bar_rows=bar_rows)
 
     #################################################################################################
 

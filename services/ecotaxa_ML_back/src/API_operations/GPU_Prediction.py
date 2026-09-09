@@ -182,6 +182,8 @@ class GPUPredictForProject(PredictForProject):
         pred_ids, _scores = eval_classifier.predict(test_X)
         pred_y = np.array(pred_ids)
 
+        train_counts = Counter(train_y.tolist())
+
         per_taxon_counts: Dict[int, Dict[str, int]] = {}
         for true_id, pred_id in zip(test_y.tolist(), pred_y.tolist()):
             entry = per_taxon_counts.setdefault(true_id, {"support": 0, "correct": 0})
@@ -205,6 +207,7 @@ class GPUPredictForProject(PredictForProject):
                 {
                     "classif_id": int(taxon_id),
                     "name": names.get(taxon_id, str(taxon_id)),
+                    "train_support": int(train_counts.get(taxon_id, 0)),
                     "support": c["support"],
                     "correct": c["correct"],
                     "accuracy": round(accuracy, 4),
