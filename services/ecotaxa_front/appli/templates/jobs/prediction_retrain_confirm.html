@@ -32,4 +32,10 @@
   </div>
 
   {% include "jobs/_training_history_chart.html" with context %}
+
+  {% if evaluation_html %}
+    <h4>Performance details from last model version</h4>
+    <p><small>Version {{ model.version_count }}, trained {{ model.training_start }}.</small></p>
+    {{ evaluation_html|safe }}
+  {% endif %}
 {% endblock %}

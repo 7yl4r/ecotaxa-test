@@ -699,11 +699,16 @@ class PredictionJob(Job):
         blocked_reason = cls._retrain_blocker(target_prj, model)
         with ApiClient(ProjectsApi, request) as api:
             history = api.get_training_history(target_prj.projid, model_name=model_name)
+        # Held-out evaluation (table + per-taxon bar chart) for the model's current
+        # (last-trained) version, so you can see how it's doing before deciding to
+        # re-train it -- same rendering as the job monitor page for that training.
+        evaluation_html = cls.RenderEvaluation(history[-1]["evaluation"]) if history else ""
         return render_template('jobs/prediction_retrain_confirm.html',
                                filters_info=filters_html,
                                projid=target_prj.projid,
                                model_name=model_name, model=model,
-                               blocked_reason=blocked_reason, history=history)
+                               blocked_reason=blocked_reason, history=history,
+                               evaluation_html=evaluation_html)
 
     @classmethod
     def retrain_start_task(cls):
