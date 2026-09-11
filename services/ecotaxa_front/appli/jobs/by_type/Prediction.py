@@ -290,7 +290,7 @@ class PredictionJob(Job):
         bar_rows = "".join(
             """
             <div style="display:flex; align-items:center; gap:8px; height:22px;"
-                 title="{name_attr}: {correct}/{support} correct in test, {train} image(s) in training set">
+                 data-tip="{name_attr}: {correct}/{support} correct in test, {train} image(s) in training set">
               <div style="width:180px; flex:0 0 180px; font-size:12px; text-align:right;
                           white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{name}</div>
               <div style="position:relative; flex:1 1 auto; height:16px;">
@@ -343,7 +343,7 @@ class PredictionJob(Job):
 
         header_cells = "".join(
             '<th style="font-size:11px; text-align:center; padding:3px 5px; '
-            'font-weight:normal; color:#666;" title="{name}">{num}</th>'.format(
+            'font-weight:normal; color:#666;" data-tip="Predicted: {name}">{num}</th>'.format(
                 name=XSSEscape(name_of[order_ids[j]]), num=j + 1
             )
             for j in range(n)
@@ -365,7 +365,7 @@ class PredictionJob(Job):
                 cells.append(
                     '<td style="text-align:center; font-size:11px; padding:3px 5px; '
                     'min-width:24px; {bg} {diag}" '
-                    'title="Actual {actual} -&gt; predicted {predicted}: {count} ({pct:.0f}%)">'
+                    'data-tip="Actual {actual} -&gt; predicted {predicted}: {count} ({pct:.0f}%)">'
                     '{display}</td>'.format(
                         bg=bg, diag=diag,
                         actual=XSSEscape(name_of[order_ids[i]]),
@@ -377,7 +377,7 @@ class PredictionJob(Job):
             body_rows.append(
                 '<tr><th style="font-size:12px; font-weight:normal; text-align:right; '
                 'white-space:nowrap; padding-right:6px; max-width:180px; overflow:hidden; '
-                'text-overflow:ellipsis;" title="{name}">{num}. {name}</th>{cells}</tr>'.format(
+                'text-overflow:ellipsis;" data-tip="Actual: {name}">{num}. {name}</th>{cells}</tr>'.format(
                     name=XSSEscape(name_of[order_ids[i]]), num=i + 1, cells="".join(cells)
                 )
             )
@@ -402,7 +402,51 @@ class PredictionJob(Job):
             <span style="font-size:11px; color:#666;">100% of row</span>
           </div>
         </div>
-        """.format(header=header_cells, rows="".join(body_rows))
+        """.format(header=header_cells, rows="".join(body_rows)) + cls._TOOLTIP_SCRIPT
+
+    # Same delegated tooltip layer as _training_history_chart.html's script, duplicated
+    # (idempotently -- see the guard) so this table's [data-tip] cells get a working
+    # hover even if that chart isn't also on the page. A plain `title` attribute
+    # doesn't reliably fire here: its hover-delay timer keeps resetting as the mouse
+    # crosses this many small, closely-packed cells.
+    # NB: kept out of any %/.format()-templated string -- it's full of literal {}.
+    _TOOLTIP_SCRIPT = """
+        <script>
+          if (!window.__ecotaxaTipDelegated__) {
+            window.__ecotaxaTipDelegated__ = true;
+            var tipEl = null;
+            var ecotaxaTipEl = function () {
+              if (!tipEl) {
+                tipEl = document.createElement("div");
+                tipEl.style.cssText = "position:fixed; display:none; z-index:2000; background:#333; " +
+                  "color:#fff; font-size:11px; padding:4px 7px; border-radius:3px; " +
+                  "pointer-events:none; white-space:pre-line; max-width:280px; " +
+                  "box-shadow:0 1px 4px rgba(0,0,0,.3);";
+                document.body.appendChild(tipEl);
+              }
+              return tipEl;
+            };
+            document.addEventListener("mouseover", function (evt) {
+              var target = evt.target.closest && evt.target.closest("[data-tip]");
+              if (!target) return;
+              var t = ecotaxaTipEl();
+              t.textContent = target.getAttribute("data-tip");
+              t.style.display = "block";
+            });
+            document.addEventListener("mousemove", function (evt) {
+              if (tipEl && tipEl.style.display === "block") {
+                tipEl.style.left = (evt.clientX + 12) + "px";
+                tipEl.style.top = (evt.clientY + 12) + "px";
+              }
+            });
+            document.addEventListener("mouseout", function (evt) {
+              if (evt.target.closest && evt.target.closest("[data-tip]") && tipEl) {
+                tipEl.style.display = "none";
+              }
+            });
+          }
+        </script>
+        """
 
     #################################################################################################
 

@@ -15,6 +15,48 @@
     <div id="trnhist-{{ chart_id|default('main') }}"></div>
     <script>
       (function () {
+        // Shared hover-tooltip layer for both this chart and the confusion matrix
+        // (@see prediction_create_testsplit.html / RenderConfusionMatrix). A plain
+        // `title`/SVG `<title>` attribute is unreliable here: it relies on the
+        // browser's own hover-delay timer, which keeps resetting as the mouse moves
+        // across many small, closely-packed targets (chart points, matrix cells) --
+        // in practice it often never fires. This shows/moves a tooltip immediately
+        // on any element with a `data-tip` attribute, via one delegated listener
+        // set up at most once regardless of how many charts/matrices are on the page.
+        if (!window.__ecotaxaTipDelegated__) {
+          window.__ecotaxaTipDelegated__ = true;
+          var tipEl = null;
+          function ecotaxaTipEl() {
+            if (!tipEl) {
+              tipEl = document.createElement("div");
+              tipEl.style.cssText = "position:fixed; display:none; z-index:2000; background:#333; " +
+                "color:#fff; font-size:11px; padding:4px 7px; border-radius:3px; " +
+                "pointer-events:none; white-space:pre-line; max-width:280px; " +
+                "box-shadow:0 1px 4px rgba(0,0,0,.3);";
+              document.body.appendChild(tipEl);
+            }
+            return tipEl;
+          }
+          document.addEventListener("mouseover", function (evt) {
+            var target = evt.target.closest && evt.target.closest("[data-tip]");
+            if (!target) return;
+            var t = ecotaxaTipEl();
+            t.textContent = target.getAttribute("data-tip");
+            t.style.display = "block";
+          });
+          document.addEventListener("mousemove", function (evt) {
+            if (tipEl && tipEl.style.display === "block") {
+              tipEl.style.left = (evt.clientX + 12) + "px";
+              tipEl.style.top = (evt.clientY + 12) + "px";
+            }
+          });
+          document.addEventListener("mouseout", function (evt) {
+            if (evt.target.closest && evt.target.closest("[data-tip]") && tipEl) {
+              tipEl.style.display = "none";
+            }
+          });
+        }
+
         if (typeof renderTrainingHistoryChart !== "function") {
           window.renderTrainingHistoryChart = function (containerId, history) {
             var el = document.getElementById(containerId);
@@ -88,7 +130,9 @@
               svg.push('<path d="' + macroPath + '" fill="none" stroke="#f0ad4e" stroke-width="2" ' +
                 'stroke-dasharray="4,3"/>');
             }
-            // Points + tooltips (native <title>) on the overall-accuracy line
+            // Points + tooltips on the overall-accuracy line. Two circles per point:
+            // a small visible dot, and a larger invisible one on top purely to make
+            // the hover target easier to hit (see the shared tooltip layer above).
             for (var i = 0; i < n; i++) {
               var ev = history[i].evaluation || {};
               if (ev.overall_accuracy === null || ev.overall_accuracy === undefined) continue;
@@ -98,8 +142,11 @@
                 "\nOverall: " + (ev.overall_accuracy * 100).toFixed(1) + "%" +
                 (ev.macro_accuracy != null ? "\nMacro-avg: " + (ev.macro_accuracy * 100).toFixed(1) + "%" : "") +
                 "\nTest size: " + (ev.test_size != null ? ev.test_size : "?");
-              svg.push('<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="#337ab7">' +
-                '<title>' + label.replace(/&/g, "&amp;").replace(/</g, "&lt;") + '</title></circle>');
+              var escapedLabel = label.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+              svg.push('<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="#337ab7"></circle>');
+              svg.push('<circle cx="' + cx + '" cy="' + cy + '" r="9" fill="transparent" ' +
+                'data-tip="' + escapedLabel + '"></circle>');
             }
             svg.push("</svg>");
             svg.push('<div><span style="color:#337ab7">&#9632;</span> Overall accuracy &nbsp; ' +
