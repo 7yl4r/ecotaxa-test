@@ -2,7 +2,7 @@
 
 Docker Compose stack for a local/self-hosted EcoTaxa instance, adapted from
 the official ["all_in_one"](https://github.com/ecotaxa/ecotaxa_front/tree/master/docker/all_in_one)
-example maintained by the EcoTaxa team.
+example.
 
 ## Services
 
