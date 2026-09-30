@@ -28,7 +28,8 @@ docker compose build
 
 The build compiles all three app services from source (the ML back-end in
 particular is a slow, multi-GB build the first time — CUDA base image +
-TensorFlow). `setup.sh` then starts postgres, creates the `ecotaxa`
+TensorFlow). `setup.sh` then generates `.env` if it doesn't exist yet (see
+[Configuration](#configuration)), starts postgres, creates the `ecotaxa`
 database, builds the schema, sets the administrator credentials, and brings
 up the full stack. It prints the admin login at the end.
 
@@ -171,7 +172,7 @@ doesn't need this — its Dockerfile builds straight from the repo root.
 - `back_config.ini` — back-end config (DB connection, vault paths, secrets). Mounted read-only into `ecotaxaback` as `/config.ini`.
 - `front_config/` — front-end config, including `config.cfg` (must share `SECRET_KEY` / `MAILSERVICE_SECRET_KEY` with `back_config.ini`) and customizable home-page HTML snippets.
 - `nginx.conf` — reverse proxy config. Not production-hardened (no TLS) — put a real reverse proxy in front if exposing this beyond your local network.
-- `.env` — `DB_PASSWORD` used by the `pgdb` container; must match `DB_PASSWORD` in `back_config.ini`.
+- `.env` — not committed; `setup.sh` creates it on first run. It holds `DB_PASSWORD` (the `pgdb` container's password, copied from `DB_PASSWORD` in `back_config.ini` — the two must match), `ADMIN_EMAIL` (default `administrator@mail.test`), and `ADMIN_PASSWORD` (randomly generated). `seed.sh` reads the admin credentials from it too. To pick your own admin credentials, create `.env` with those three keys before running `make setup`.
 
 Data persists in these bind-mounted directories:
 

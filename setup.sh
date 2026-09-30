@@ -5,6 +5,25 @@
 # to (re)start the stack afterwards use start.sh instead.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# Generate .env on first run. DB_PASSWORD is taken from back_config.ini so the
+# pgdb container and the back-end always agree; the admin password is random.
+if [ ! -f .env ]; then
+  echo "==> No .env found, generating one..."
+  db_password=$(sed -n 's/^DB_PASSWORD *= *//p' back_config.ini | tr -d '[:space:]')
+  if [ -z "$db_password" ]; then
+    echo "ERROR: could not read DB_PASSWORD from back_config.ini" >&2
+    exit 1
+  fi
+  umask 077
+  cat > .env <<EOF
+DB_PASSWORD=${db_password}
+ADMIN_EMAIL=administrator@mail.test
+ADMIN_PASSWORD=$(openssl rand -hex 12)
+EOF
+  umask 022
+fi
+
 set -a
 source .env
 set +a
