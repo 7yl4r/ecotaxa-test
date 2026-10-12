@@ -52,13 +52,17 @@ sleep 5
 echo "==> Building the database schema..."
 docker exec -i ecotaxa_back bash -c "PYTHONPATH=. python cmds/manage.py db build"
 
-echo "==> Applying local schema patches..."
-docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
-  "ALTER TABLE training
-     ADD COLUMN IF NOT EXISTS evaluation JSONB,
-     ADD COLUMN IF NOT EXISTS model_name VARCHAR(120),
-     ADD COLUMN IF NOT EXISTS config JSONB,
-     ADD COLUMN IF NOT EXISTS learning_set_size INTEGER;"
+# `db build` creates tables straight from the SQLAlchemy models, i.e. already at
+# the latest Alembic revision, but doesn't record that. Stamp a freshly built DB
+# so later schema changes (py/cmds/db_upg/versions) apply with `upgrade head`;
+# a DB that is already stamped (setup re-run) is just upgraded.
+echo "==> Applying schema migrations..."
+if docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -tc \
+     "SELECT to_regclass('public.alembic_version')" | grep -q alembic_version; then
+  docker exec -i -w /app/cmds ecotaxa_back bash -c "PYTHONPATH=.. alembic upgrade head"
+else
+  docker exec -i -w /app/cmds ecotaxa_back bash -c "PYTHONPATH=.. alembic stamp head"
+fi
 
 echo "==> Setting administrator credentials..."
 docker exec -i ecotaxa_pgdb psql -U postgres -h localhost -d ecotaxa -c \
