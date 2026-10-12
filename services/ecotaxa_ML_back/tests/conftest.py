@@ -1,8 +1,0 @@
-#
-# As per pytest doc, gather common fixtures in this specially-named file
-#
-# noinspection PyUnresolvedReferences
-from config_fixture import *
-
-# noinspection PyUnresolvedReferences
-from db_fixture import *

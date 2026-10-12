@@ -6,6 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Patched service source lives in submodules; make sure they are checked out.
+./submodules.sh
+
 # Generate .env on first run. DB_PASSWORD is taken from back_config.ini so the
 # pgdb container and the back-end always agree; the admin password is random.
 if [ ! -f .env ]; then

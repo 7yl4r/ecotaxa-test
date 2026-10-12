@@ -1,0 +1,15 @@
+[submodule "services/ecotaxa_back"]
+	path = services/ecotaxa_back
+	url = git@github.com:7yl4r/ecotaxa_back.git
+	branch = train-test-split
+	ignore = untracked
+[submodule "services/ecotaxa_front"]
+	path = services/ecotaxa_front
+	url = git@github.com:7yl4r/ecotaxa_front.git
+	branch = train-test-split
+	ignore = untracked
+[submodule "services/ecotaxa_ML_back"]
+	path = services/ecotaxa_ML_back
+	url = git@github.com:7yl4r/ecotaxa_ML_back.git
+	branch = train-test-split
+	ignore = untracked

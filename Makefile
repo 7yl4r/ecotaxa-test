@@ -1,9 +1,10 @@
 SHELL := /bin/bash
 
-.PHONY: help build sync setup start restart rebuild seed
+.PHONY: help submodules build sync setup start restart rebuild seed
 
 help:
 	@echo "Targets:"
+	@echo "  make submodules - clone any missing services/ submodules and add their upstream remotes (./submodules.sh)"
 	@echo "  make build    - docker compose build (syncs local patches into ecotaxaback/ecotaxafront first)"
 	@echo "  make sync     - re-sync services/ecotaxa_back and services/ecotaxa_front patches into their docker/py/ build context"
 	@echo "  make setup    - first-time setup: create DB, build schema, set admin creds, bring up the stack (./setup.sh)"
@@ -12,10 +13,13 @@ help:
 	@echo "  make rebuild  - full rebuild: wipe DB + instance data (docker compose down -v), reseed from scratch (./reset.sh)"
 	@echo "  make seed     - (re)generate and import the synthetic 'Seed Test Dataset' project (./seed.sh)"
 
+submodules:
+	./submodules.sh
+
 # Re-sync patched local source into the two services whose Dockerfiles build
 # from a docker/py/ copy rather than the repo root. Mirrors upstream's
 # docker/build_prod.sh. ecotaxa_ML_back needs no equivalent step.
-sync:
+sync: submodules
 	cd services/ecotaxa_back/docker && rsync -avr --exclude-from=not_to_copy.lst ../py/ py/
 	mkdir -p services/ecotaxa_back/docker/docker/prod_image
 	cp services/ecotaxa_back/docker/prod_image/start.sh services/ecotaxa_back/docker/docker/prod_image/

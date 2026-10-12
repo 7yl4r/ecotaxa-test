@@ -19,12 +19,14 @@ local source in `services/` rather than pulled from Docker Hub — see
 ## First run
 
 ```sh
+git clone --recurse-submodules git@github.com:7yl4r/ecotaxa-test.git
 make build
 make setup
-# or, equivalently:
-docker compose build
-./setup.sh
 ```
+
+`make build` checks out the `services/` submodules if they're missing
+(`./submodules.sh`; see [Local patches](#local-patches-to-vendored-source)),
+syncs them into their build contexts, then runs `docker compose build`.
 
 The build compiles all three app services from source (the ML back-end in
 particular is a slow, multi-GB build the first time — CUDA base image +
@@ -141,7 +143,42 @@ setup here.
 ## Local patches to vendored source
 
 `services/ecotaxa_back`, `services/ecotaxa_front`, `services/ecotaxa_ML_back`
-are patched clones of the upstream repos (not submodules — `.git` stripped).
+are git submodules. Each one points at a fork (`origin` =
+`git@github.com:7yl4r/<repo>`) with the official repo added as `upstream`
+(`https://github.com/ecotaxa/<repo>`). Local patches live on the
+`train-test-split` branch of each fork, so a PR to upstream is just a PR from
+`7yl4r:<repo>:train-test-split` to `ecotaxa:<repo>`.
+
+Clone with submodules:
+
+```sh
+git clone --recurse-submodules git@github.com:7yl4r/ecotaxa-test.git
+# or, in an existing clone:
+make submodules        # = ./submodules.sh
+```
+
+`make setup`, `make build` and `make restart` all run `./submodules.sh` first.
+It clones any submodule that is missing, puts it on `train-test-split`, and
+adds the `upstream` remote. Submodules that are already checked out are left
+alone, so it never moves you off a branch you're working on. (A plain
+`git submodule update` leaves submodules on a detached HEAD; run
+`git -C services/<repo> switch train-test-split` before committing.)
+Working on a patch:
+
+```sh
+cd services/ecotaxa_front
+git switch train-test-split          # or a new topic branch for a focused PR
+# ...edit, commit...
+git push origin train-test-split
+cd ../.. && git add services/ecotaxa_front && git commit   # bump the pinned commit
+```
+
+To pull in upstream changes: `git fetch upstream && git rebase upstream/master`
+(`upstream/main` for `ecotaxa_ML_back`), then `git push --force-with-lease`.
+
+Each submodule sets `ignore = untracked`, so the `docker/py/` copies that
+`make sync` generates don't show up as changes in the parent repo.
+
 Patches so far: `test_fraction` added to the `PredictionReq` API model in
 both `ecotaxa_back` and `ecotaxa_ML_back`; the actual split/evaluate logic in
 `ecotaxa_ML_back`'s `API_operations/GPU_Prediction.py`; the wizard UI field
