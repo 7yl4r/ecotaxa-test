@@ -20,10 +20,10 @@ submodules:
 # from a docker/py/ copy rather than the repo root. Mirrors upstream's
 # docker/build_prod.sh. ecotaxa_ML_back needs no equivalent step.
 sync: submodules
-	cd services/ecotaxa_back/docker && rsync -avr --exclude-from=not_to_copy.lst ../py/ py/
+	cd services/ecotaxa_back/docker && rsync -avr --delete --exclude-from=not_to_copy.lst ../py/ py/
 	mkdir -p services/ecotaxa_back/docker/docker/prod_image
 	cp services/ecotaxa_back/docker/prod_image/start.sh services/ecotaxa_back/docker/docker/prod_image/
-	cd services/ecotaxa_front/docker && rsync -avr --exclude=docker --exclude-from=not_to_copy.lst .. py/
+	cd services/ecotaxa_front/docker && rsync -avr --delete --exclude=docker --exclude-from=not_to_copy.lst .. py/
 
 build: sync
 	docker compose build

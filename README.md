@@ -195,9 +195,9 @@ services with:
 ```sh
 make sync
 # or, equivalently:
-cd services/ecotaxa_back/docker && rsync -avr --exclude-from=not_to_copy.lst ../py/ py/
+cd services/ecotaxa_back/docker && rsync -avr --delete --exclude-from=not_to_copy.lst ../py/ py/
 mkdir -p docker/prod_image && cp prod_image/start.sh docker/prod_image/
-cd services/ecotaxa_front/docker && rsync -avr --exclude=docker --exclude-from=not_to_copy.lst .. py/
+cd services/ecotaxa_front/docker && rsync -avr --delete --exclude=docker --exclude-from=not_to_copy.lst .. py/
 ```
 
 then `docker compose build ecotaxaback ecotaxafront` (or just `make build` /
