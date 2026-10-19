@@ -53,9 +53,9 @@ CATEGORIES = [
     ("Euphausiacea", 45041, 25, 4.5, 100),
     ("Amphipoda", 45054, 20, 3.2, 80),
     ("Decapoda", 45043, 15, 2.5, 95),
-    ("Cladocera", 45036, 60, 1.4, 50),
+    ("Diplostraca", 25817, 60, 1.4, 50),  # was Cladocera (45036), deprecated on EcoTaxoServer
     ("Foraminifera", 11758, 300, 1.1, 35),
-    ("Radiolaria", 94043, 280, 1.2, 45),
+    ("Radiozoa", 92677, 280, 1.2, 45),  # was Radiolaria (94043), deprecated
     ("Ciliophora", 2250, 320, 1.5, 30),
     ("Annelida", 11518, 10, 5.5, 90),
     ("Gastropoda", 12905, 260, 1.3, 55),
@@ -64,7 +64,7 @@ CATEGORIES = [
     ("Doliolida", 25944, 180, 1.2, 85),
     ("Salpida", 25942, 170, 1.4, 100),
     ("Polychaeta", 12838, 5, 4.8, 90),
-    ("Thecosomata", 91704, 240, 1.3, 60),
+    ("Euthecosomata", 91869, 240, 1.3, 60),  # was Thecosomata (91704), deprecated
     ("Bryozoa", 11515, 100, 1.6, 50),
     ("Echinodermata", 11509, 340, 1.1, 65),
     ("Mollusca", 11498, 250, 1.4, 70),

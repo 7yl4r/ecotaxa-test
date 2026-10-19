@@ -22,6 +22,7 @@ local source in `services/` rather than pulled from Docker Hub — see
 git clone --recurse-submodules git@github.com:7yl4r/ecotaxa-test.git
 make build
 make setup
+make seed
 ```
 
 `make build` checks out the `services/` submodules if they're missing
@@ -33,7 +34,8 @@ particular is a slow, multi-GB build the first time — CUDA base image +
 TensorFlow). `setup.sh` then generates `.env` if it doesn't exist yet (see
 [Configuration](#configuration)), starts postgres, creates the `ecotaxa`
 database, builds the schema, sets the administrator credentials, and brings
-up the full stack. It prints the admin login at the end.
+up the full stack. It prints the admin login at the end. `make seed` then
+loads the test dataset. See [Test account and dataset](#test-account-and-dataset).
 
 Then open **http://localhost:8088**.
 
@@ -69,9 +71,20 @@ postgres volume and clears those same directories before reinstalling and
 reseeding, for when you want a guaranteed-clean instance rather than an
 incremental update.
 
-## Test dataset
+## Test account and dataset
 
-`seed/` generates a deterministic synthetic dataset (fixed random seed) and
+**Account.** `make setup` creates one administrator account, which is also
+the account the test dataset belongs to:
+
+- Login: `ADMIN_EMAIL` in `.env` (default `administrator@mail.test`)
+- Password: `ADMIN_PASSWORD` in `.env` (random, generated on first setup)
+
+`setup.sh` prints both at the end, and `seed.sh` prints the login again. To
+choose your own, create `.env` before the first `make setup` (see
+[Configuration](#configuration)). `make rebuild` keeps the same `.env`, so the
+login survives a full wipe.
+
+**Dataset.** `seed/` generates a deterministic synthetic dataset (fixed random seed) and
 imports it into a project called **"Seed Test Dataset"**: 600 objects across
 3 sample stations and 26 real plankton taxa (pulled from EcoTaxoServer),
 ~73% `validated` / ~27% `predicted`. Each object also gets 11 numeric
@@ -90,7 +103,9 @@ make seed
 Safe to re-run any time — it deletes the previous "Seed Test Dataset"
 project and rebuilds it from scratch with the same seed, so the data is
 identical on every run. It needs the stack up and the admin account created
-first (`./setup.sh`), and network access to `ecotaxoserver.obs-vlfr.fr` (the
+first (`./setup.sh`), `python3` and `curl` on the host (it builds its own
+`.venv-seed`, bootstrapping pip itself if the system Python lacks `ensurepip`),
+and network access to `ecotaxoserver.obs-vlfr.fr` (the
 public EcoTaxa taxonomy server) the first time it pulls taxonomy — after
 that the pull is a fast no-op.
 
